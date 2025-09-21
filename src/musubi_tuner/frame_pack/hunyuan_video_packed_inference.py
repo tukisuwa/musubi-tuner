@@ -16,6 +16,22 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+def pad_for_3d_conv(x, kernel_size):
+    b, c, t, h, w = x.shape
+    pt, ph, pw = kernel_size
+    pad_t = (pt - (t % pt)) % pt
+    pad_h = (ph - (h % ph)) % ph
+    pad_w = (pw - (w % pw)) % pw
+    return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h, 0, pad_t), mode="replicate")
+
+
+def center_down_sample_3d(x, kernel_size):
+    # pt, ph, pw = kernel_size
+    # cp = (pt * ph * pw) // 2
+    # xp = einops.rearrange(x, 'b c (t pt) (h ph) (w pw) -> (pt ph pw) b c t h w', pt=pt, ph=ph, pw=pw)
+    # xc = xp[cp]
+    # return xc
+    return torch.nn.functional.avg_pool3d(x, kernel_size, stride=kernel_size)
 
 class HunyuanVideoTransformer3DModelPackedInference(HunyuanVideoTransformer3DModelPacked):
     def __init__(self, *args, **kwargs):
@@ -113,7 +129,6 @@ class HunyuanVideoTransformer3DModelPackedInference(HunyuanVideoTransformer3DMod
             self.mag_ratios = nearest_interp(self.default_mag_ratios, num_steps)
         else:
             self.mag_ratios = self.default_mag_ratios
-
         self.cnt = 0
         self.num_steps = num_steps
         self.residual_cache = None
@@ -129,12 +144,76 @@ class HunyuanVideoTransformer3DModelPackedInference(HunyuanVideoTransformer3DMod
             raise ValueError("MagCache is not enabled or calibration is not set.")
         return self.norm_ratio, self.norm_std, self.cos_dis
 
+    def process_input_hidden_states(
+        self,
+        latents,
+        latent_indices=None,
+        clean_latents=None,
+        clean_latent_indices=None,
+        clean_latents_2x=None,
+        clean_latent_2x_indices=None,
+        clean_latents_4x=None,
+        clean_latent_4x_indices=None,
+    ):
+        hidden_states = self.gradient_checkpointing_method(self.x_embedder.proj, latents)
+        B, C, T, H, W = hidden_states.shape
+
+        if latent_indices is None:
+            latent_indices = torch.arange(0, T).unsqueeze(0).expand(B, -1)
+
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+        rope_freqs = self.rope(frame_indices=latent_indices, height=H, width=W, device=hidden_states.device)
+        rope_freqs = rope_freqs.flatten(2).transpose(1, 2)
+
+        if clean_latents is not None and clean_latent_indices is not None:
+            clean_latents = clean_latents.to(hidden_states)
+            clean_latents = self.gradient_checkpointing_method(self.clean_x_embedder.proj, clean_latents)
+            clean_latents = clean_latents.flatten(2).transpose(1, 2)
+
+            clean_latent_rope_freqs = self.rope(frame_indices=clean_latent_indices, height=H, width=W, device=clean_latents.device)
+            clean_latent_rope_freqs = clean_latent_rope_freqs.flatten(2).transpose(1, 2)
+
+            hidden_states = torch.cat([clean_latents, hidden_states], dim=1)
+            rope_freqs = torch.cat([clean_latent_rope_freqs, rope_freqs], dim=1)
+
+        if clean_latents_2x is not None and clean_latent_2x_indices is not None:
+            clean_latents_2x = clean_latents_2x.to(hidden_states)
+            clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
+            clean_latents_2x = self.gradient_checkpointing_method(self.clean_x_embedder.proj_2x, clean_latents_2x)
+            clean_latents_2x = clean_latents_2x.flatten(2).transpose(1, 2)
+
+            clean_latent_2x_rope_freqs = self.rope(
+                frame_indices=clean_latent_2x_indices, height=H, width=W, device=clean_latents_2x.device
+            )
+            clean_latent_2x_rope_freqs = pad_for_3d_conv(clean_latent_2x_rope_freqs, (2, 2, 2))
+            clean_latent_2x_rope_freqs = center_down_sample_3d(clean_latent_2x_rope_freqs, (2, 2, 2))
+            clean_latent_2x_rope_freqs = clean_latent_2x_rope_freqs.flatten(2).transpose(1, 2)
+
+            hidden_states = torch.cat([clean_latents_2x, hidden_states], dim=1)
+            rope_freqs = torch.cat([clean_latent_2x_rope_freqs, rope_freqs], dim=1)
+
+        if clean_latents_4x is not None and clean_latent_4x_indices is not None:
+            clean_latents_4x = clean_latents_4x.to(hidden_states)
+            clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
+            clean_latents_4x = self.gradient_checkpointing_method(self.clean_x_embedder.proj_4x, clean_latents_4x)
+            clean_latents_4x = clean_latents_4x.flatten(2).transpose(1, 2)
+
+            clean_latent_4x_rope_freqs = self.rope(
+                frame_indices=clean_latent_4x_indices, height=H, width=W, device=clean_latents_4x.device
+            )
+            clean_latent_4x_rope_freqs = pad_for_3d_conv(clean_latent_4x_rope_freqs, (4, 4, 4))
+            clean_latent_4x_rope_freqs = center_down_sample_3d(clean_latent_4x_rope_freqs, (4, 4, 4))
+            clean_latent_4x_rope_freqs = clean_latent_4x_rope_freqs.flatten(2).transpose(1, 2)
+
+            hidden_states = torch.cat([clean_latents_4x, hidden_states], dim=1)
+            rope_freqs = torch.cat([clean_latent_4x_rope_freqs, rope_freqs], dim=1)
+
+        return hidden_states, rope_freqs
+
     def forward(self, *args, **kwargs):
         # Forward pass for inference
-        if self.enable_magcache:
-            return self.magcache_forward(*args, **kwargs, calibration=self.calibration)
-        else:
-            return super().forward(*args, **kwargs)
+        return self.magcache_forward(*args, **kwargs)
 
     def magcache_forward(
         self,
@@ -156,6 +235,7 @@ class HunyuanVideoTransformer3DModelPackedInference(HunyuanVideoTransformer3DMod
         return_dict=True,
         calibration=False,
     ):
+
         if attention_kwargs is None:
             attention_kwargs = {}
 

@@ -3,6 +3,7 @@ import glob
 from importlib.util import find_spec
 import json
 import math
+import re
 import os
 import random
 import time
@@ -10,6 +11,7 @@ from typing import Any, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file, load_file
 from PIL import Image
 import cv2
@@ -169,8 +171,10 @@ class ItemInfo:
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
         self.fp_1f_clean_indices: Optional[list[int]] = None  # indices of clean latents for 1f
-        self.fp_1f_target_index: Optional[int] = None  # target index for 1f clean latents
+        self.fp_1f_target_index: Optional[Union[int, list[int]]] = None  # target index for 1f clean latents
         self.fp_1f_no_post: Optional[bool] = None  # whether to add zero values as clean latent post
+        self.control_indices: Optional[list[int]] = None
+        self.target_indices: Optional[list[int]] = None
 
     def __str__(self) -> str:
         return (
@@ -187,13 +191,20 @@ class ItemInfo:
 # and `<content_type>_<dtype|mask>` for other tensors
 
 
-def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
-    """HunyuanVideo architecture. HunyuanVideo doesn't support I2V and control latents"""
+def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor, control_latent: Optional[torch.Tensor] = None):
+    """HunyuanVideo architecture."""
     assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
+    assert (
+        control_latent is None or control_latent.dim() == 4
+    ), "control_latent should be 4D tensor (frame, channel, height, width) or None"
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu()}
+
+    if control_latent is not None:
+        _, F_c, H_c, W_c = control_latent.shape
+        sd[f"latents_control_{F_c}x{H_c}x{W_c}_{dtype_str}"] = control_latent.detach().cpu()
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_FULL)
 
@@ -314,6 +325,14 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     }
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
+
+    if item_info.fp_1f_clean_indices is not None:
+        metadata["control_indices"] = json.dumps(item_info.fp_1f_clean_indices)
+    if item_info.fp_1f_target_index is not None:
+        target_indices = item_info.fp_1f_target_index
+        if isinstance(target_indices, int):
+            target_indices = [target_indices]
+        metadata["target_indices"] = json.dumps(target_indices)
 
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
@@ -738,9 +757,24 @@ class BucketBatchManager:
         batch_tensor_data = {}
         varlen_keys = set()
         for item_info in bucket[start:end]:
-            sd_latent = load_file(item_info.latent_cache_path)
+            with safe_open(item_info.latent_cache_path, framework="pt", device="cpu") as f:
+                sd_latent = {key: f.get_tensor(key) for key in f.keys()}
+                metadata = f.metadata() if f.metadata() is not None else {}
+
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
+
+            if "control_indices" in metadata:
+                control_indices = torch.tensor(json.loads(metadata["control_indices"]), dtype=torch.long)
+                if "control_indices" not in batch_tensor_data:
+                    batch_tensor_data["control_indices"] = []
+                batch_tensor_data["control_indices"].append(control_indices)
+
+            if "target_indices" in metadata:
+                target_indices = torch.tensor(json.loads(metadata["target_indices"]), dtype=torch.long)
+                if "target_indices" not in batch_tensor_data:
+                    batch_tensor_data["target_indices"] = []
+                batch_tensor_data["target_indices"].append(target_indices)
 
             # TODO refactor this
             for key in sd.keys():
@@ -1004,18 +1038,236 @@ class ImageJsonlDatasource(ImageDatasource):
 
         return image_path, image, caption, controls
 
-    def get_caption(self, idx: int) -> tuple[str, str]:
-        data = self.data[idx]
-        image_path = data["image_path"]
-        caption = data["caption"]
+class GroupedImageDirectoryDatasource(ImageDatasource):
+    def __init__(
+        self,
+        image_directory: str,
+        caption_extension: Optional[str] = None,
+        control_frame_selection_method: str = "center",
+        control_frame_index: Optional[int] = None,
+        control_indices: Optional[Sequence[int]] = None,
+        target_indices: Optional[Sequence[int]] = None,
+        control_image_dir: Optional[str] = None,
+    ):
+        super().__init__()
+        self.image_directory = image_directory
+        self.caption_extension = caption_extension
+        self.control_image_dir = control_image_dir
+        self.control_frame_selection_method = control_frame_selection_method
+        self.control_frame_index = control_frame_index
+        self.control_indices = control_indices
+        self.target_indices = target_indices
+        self.current_idx = 0
+        self.has_control = True  # This datasource always provides control frames
+
+        # 1. Glob all images and group them by prefix
+        logger.info(f"glob images in {self.image_directory}")
+        all_image_paths = glob_images(self.image_directory)
+        logger.info(f"found {len(all_image_paths)} images")
+
+        groups: Dict[str, List[Tuple[int, str]]] = {}
+        for path in all_image_paths:
+            basename = os.path.basename(path)
+            base, ext = os.path.splitext(basename)
+            match = re.match(r"(.+)_(\d+)$", base)
+            if match:
+                prefix, index_str = match.groups()
+                index = int(index_str)
+                if prefix not in groups:
+                    groups[prefix] = []
+                groups[prefix].append((index, path))
+
+        # 2. Get control groups if control_image_dir is specified
+        control_groups = {}
+        if self.control_image_dir:
+            logger.info(f"glob control images in {self.control_image_dir}")
+            all_control_image_paths = glob_images(self.control_image_dir)
+            logger.info(f"found {len(all_control_image_paths)} control images")
+            for path in all_control_image_paths:
+                basename = os.path.basename(path)
+                base, ext = os.path.splitext(basename)
+                match = re.match(r"(.+)_(\d+)$", base)
+                if match:
+                    prefix, index_str = match.groups()
+                    index = int(index_str)
+                    if prefix not in control_groups:
+                        control_groups[prefix] = []
+                    control_groups[prefix].append((index, path))
+
+        # 3. Filter out groups with less than 2 images and sort frames by index
+        self.groups = []
+        for prefix, frames in groups.items():
+            if self.control_image_dir and prefix not in control_groups:
+                logger.warning(f"Control group for prefix '{prefix}' not found. Skipping group.")
+                continue
+            
+            if len(frames) >= 2:
+                frames.sort(key=lambda x: x[0])
+
+                if self.control_frame_index is not None:
+                    indices = [f[0] for f in frames]
+                    if self.control_frame_index not in indices:
+                        logger.warning(
+                            f"control_frame_index {self.control_frame_index} not found in group {prefix}. Skipping group."
+                        )
+                        continue
+                
+                group_data = {"prefix": prefix, "frames": frames}
+                if self.control_image_dir:
+                    control_frames = control_groups[prefix]
+                    control_frames.sort(key=lambda x: x[0])
+                    group_data["control_frames"] = control_frames
+                self.groups.append(group_data)
+        
+        logger.info(f"found {len(self.groups)} groups for multi-frame training")
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.groups)
+
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, list[Image.Image], list[int], list[int]]:
+        group = self.groups[idx]
+        frames = group["frames"]
+        
+        frame_map = {index: path for index, path in frames}
+        indices = sorted(frame_map.keys())
+
+        control_frame_map = {index: path for index, path in group["control_frames"]} if self.control_image_dir else frame_map
+        control_available_indices = sorted(control_frame_map.keys())
+
+        # 3. Select control and target frames based on TOML settings
+        control_frame_indices = []
+        if self.control_indices is not None:
+            # Use indices from TOML
+            for i in self.control_indices:
+                if i not in control_frame_map:
+                    raise ValueError(f"control_index {i} not found in group {group['prefix']}. Available control indices: {control_available_indices}")
+            control_frame_indices = self.control_indices
+        elif self.control_frame_index is not None:
+            # Fallback to single index
+            if self.control_frame_index not in frame_map:
+                 raise ValueError(f"control_frame_index {self.control_frame_index} not found in group {group['prefix']}. Available indices: {indices}")
+            control_frame_indices = [self.control_frame_index]
+        elif self.control_frame_selection_method == "center":
+            # Fallback to center
+            control_frame_indices = [indices[len(indices) // 2]]
+        else:
+            # Fallback to center as default
+            control_frame_indices = [indices[len(indices) // 2]]
+
+        target_frame_indices = []
+        if self.target_indices is not None:
+            # Use target indices from TOML
+            for i in self.target_indices:
+                if i not in frame_map:
+                    raise ValueError(f"target_index {i} not found in group {group['prefix']}. Available indices: {indices}")
+            target_frame_indices = self.target_indices
+        else:
+            # Default to all frames except control frames
+            target_frame_indices = [i for i in indices if i not in control_frame_indices]
+
+        if self.control_image_dir:
+            control_frame_paths = [control_frame_map[i] for i in control_frame_indices]
+        else:
+            control_frame_paths = [frame_map[i] for i in control_frame_indices]
+        target_frame_paths = [frame_map[i] for i in target_frame_indices]
+
+        # 4. Load images
+        control_images = [Image.open(p).convert("RGB") for p in control_frame_paths]
+        target_images = [Image.open(p).convert("RGB") for p in target_frame_paths]
+
+        # 5. Get caption (use first control frame's caption)
+        _, caption = self._get_caption_for_path(control_frame_paths[0])
+
+        # Create a unique key for this group item
+        control_indices_str = "_".join(map(str, sorted(control_frame_indices)))
+        target_indices_str = "_".join(map(str, sorted(target_frame_indices)))
+        item_key = f"{group['prefix']}_c_{control_indices_str}_t_{target_indices_str}"
+
+        return item_key, target_images, caption, control_images, target_frame_indices, control_frame_indices
+
+    def _get_caption_for_path(self, image_path: str) -> tuple[str, str]:
+        caption_path = os.path.splitext(image_path)[0] + self.caption_extension if self.caption_extension else ""
+        if self.caption_extension and os.path.exists(caption_path):
+            with open(caption_path, "r", encoding="utf-8") as f:
+                caption = f.read().strip()
+        else:
+            caption = ""
         return image_path, caption
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        group = self.groups[idx]
+        # Use the caption of the control frame for the whole group
+        frames = group["frames"]
+        indices = [f[0] for f in frames]
+        if self.control_frame_index is not None:
+            control_idx_in_list = indices.index(self.control_frame_index)
+        elif self.control_frame_selection_method == "center":
+            control_idx_in_list = len(indices) // 2
+        else:
+            control_idx_in_list = len(indices) // 2
+
+        control_frame_index = indices[control_idx_in_list]
+        control_frame_path = frames[control_idx_in_list][1]
+
+        # Create a unique key for this group item, same as in get_image_data
+        control_indices_str = "_".join(map(str, sorted(self.control_indices)))
+        target_indices_str = "_".join(map(str, sorted(self.target_indices)))
+        item_key = f"{group['prefix']}_c_{control_indices_str}_t_{target_indices_str}"
+
+        _, caption = self._get_caption_for_path(control_frame_path)
+        return item_key, caption
 
     def __iter__(self):
         self.current_idx = 0
         return self
 
     def __next__(self) -> callable:
-        if self.current_idx >= len(self.data):
+        if self.current_idx >= len(self.groups):
+            raise StopIteration
+
+        if self.caption_only:
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+            fetcher = create_caption_fetcher(self.current_idx)
+        else:
+            def create_image_fetcher(index):
+                return lambda: self.get_image_data(index)
+            fetcher = create_image_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        group = self.groups[idx]
+        # Use the caption of the control frame for the whole group
+        frames = group["frames"]
+        indices = [f[0] for f in frames]
+        if self.control_frame_index is not None:
+            control_idx_in_list = indices.index(self.control_frame_index)
+        elif self.control_frame_selection_method == "center":
+            control_idx_in_list = len(indices) // 2
+        else:
+            control_idx_in_list = len(indices) // 2
+
+        control_frame_index = indices[control_idx_in_list]
+        control_frame_path = frames[control_idx_in_list][1]
+
+        # Create a unique key for this group item, same as in get_image_data
+        control_indices_str = "_".join(map(str, sorted(self.control_indices)))
+        target_indices_str = "_".join(map(str, sorted(self.target_indices)))
+        item_key = f"{group['prefix']}_c_{control_indices_str}_t_{target_indices_str}"
+
+        _, caption = self._get_caption_for_path(control_frame_path)
+        return item_key, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self) -> callable:
+        if self.current_idx >= len(self.groups):
             raise StopIteration
 
         if self.caption_only:
@@ -1308,6 +1560,8 @@ class BaseDataset(torch.utils.data.Dataset):
         enable_bucket: bool = False,
         bucket_no_upscale: bool = False,
         cache_directory: Optional[str] = None,
+        cache_latents: bool = False,
+        cached_latents_dir: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -1318,6 +1572,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
+        self.cache_latents = cache_latents
+        self.cached_latents_dir = cached_latents_dir
         self.debug_dataset = debug_dataset
         self.architecture = architecture
         self.seed = None
@@ -1473,6 +1729,14 @@ class ImageDataset(BaseDataset):
         image_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
+        cache_latents: bool = False,
+        cached_latents_dir: Optional[str] = None,
+        dataset_type: str = "image",
+        control_frame_selection_method: str = "center",
+        control_frame_index: Optional[int] = None,
+        control_indices: Optional[Sequence[int]] = None,
+        target_indices: Optional[Sequence[int]] = None,
+        control_image_dir: Optional[str] = None,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
@@ -1480,6 +1744,7 @@ class ImageDataset(BaseDataset):
         flux_kontext_no_resize_control: Optional[bool] = False,
         qwen_image_edit_no_resize_control: Optional[bool] = False,
         qwen_image_edit_control_resolution: Optional[Tuple[int, int]] = None,
+        enable_relative_positioning: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -1491,12 +1756,17 @@ class ImageDataset(BaseDataset):
             enable_bucket,
             bucket_no_upscale,
             cache_directory,
+            cache_latents,
+            cached_latents_dir,
             debug_dataset,
             architecture,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
         self.control_directory = control_directory
+        self.control_image_dir = control_image_dir
+        self.control_indices = control_indices
+        self.target_indices = target_indices
         self.fp_latent_window_size = fp_latent_window_size
         self.fp_1f_clean_indices = fp_1f_clean_indices
         self.fp_1f_target_index = fp_1f_target_index
@@ -1504,21 +1774,39 @@ class ImageDataset(BaseDataset):
         self.flux_kontext_no_resize_control = flux_kontext_no_resize_control
         self.qwen_image_edit_no_resize_control = qwen_image_edit_no_resize_control
         self.qwen_image_edit_control_resolution = qwen_image_edit_control_resolution
+        self.enable_relative_positioning = enable_relative_positioning
 
         control_count_per_image = 1
         if fp_1f_clean_indices is not None:
             control_count_per_image = len(fp_1f_clean_indices)
 
-        if image_directory is not None:
-            self.datasource = ImageDirectoryDatasource(
-                image_directory, caption_extension, control_directory, control_count_per_image
+        if dataset_type == "image":
+            if image_directory is not None:
+                self.datasource = ImageDirectoryDatasource(
+                    image_directory, caption_extension, control_directory, control_count_per_image
+                )
+            elif image_jsonl_file is not None:
+                self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image)
+            else:
+                raise ValueError("image_directory or image_jsonl_file must be specified for dataset_type='image'")
+        elif dataset_type == "grouped_image":
+            if image_directory is None:
+                raise ValueError("image_directory must be specified for dataset_type='grouped_image'")
+            self.datasource = GroupedImageDirectoryDatasource(
+                image_directory, caption_extension, control_frame_selection_method, control_frame_index, control_indices, target_indices, control_image_dir
             )
-        elif image_jsonl_file is not None:
-            self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image)
         else:
-            raise ValueError("image_directory or image_jsonl_file must be specified")
+            raise ValueError(f"Invalid dataset_type: {dataset_type}")
 
-        if self.cache_directory is None:
+        # 階層的なキャッシュディレクトリ解決ロジック
+        # 設計書では `general` と `dataset` での指定を区別するロジックが定義されているが、
+        # `config_utils` からその情報が渡されないため、ここでは `cached_latents_dir` があればそれを優先する、という実装に留める。
+        if self.cached_latents_dir:
+            self.cache_directory = self.cached_latents_dir
+        elif self.cache_directory:
+            # 従来のcache_directoryもフォールバックとして残す
+            pass
+        else:
             self.cache_directory = self.image_directory
 
         self.batch_manager = None
@@ -1534,6 +1822,7 @@ class ImageDataset(BaseDataset):
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["has_control"] = self.has_control
+        metadata["enable_relative_positioning"] = self.enable_relative_positioning
         return metadata
 
     def get_total_image_count(self):
@@ -1558,19 +1847,42 @@ class ImageDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_size, item_key, image, caption, controls = future.result()
-                    bucket_height, bucket_width = image.shape[:2]
-                    bucket_reso = (bucket_width, bucket_height)
+                    result = future.result()
+                    if isinstance(self.datasource, GroupedImageDirectoryDatasource):
+                        item_key, target_images, caption, control_images, target_indices, control_indices = result
+                        original_size = control_images[0].shape[1::-1]  # W, H
+                        bucket_height, bucket_width = control_images[0].shape[:2]
+                        bucket_reso = (bucket_width, bucket_height, len(target_images))
 
-                    item_info = ItemInfo(item_key, caption, original_size, bucket_reso, content=image)
+                        content = target_images
+                        control_content = control_images
+
+                        item_info = ItemInfo(
+                            item_key, caption, original_size, bucket_reso, frame_count=len(target_images), content=content
+                        )
+                        item_info.control_content = control_content
+                        item_info.target_indices = target_indices
+                        item_info.control_indices = control_indices
+                        item_info.fp_1f_target_index = target_indices
+                        item_info.fp_1f_clean_indices = control_indices
+
+                    else:
+                        original_size, item_key, image, caption, controls = result
+                        bucket_height, bucket_width = image.shape[:2]
+                        bucket_reso = (bucket_width, bucket_height)
+                        item_info = ItemInfo(item_key, caption, original_size, bucket_reso, content=image)
+                        if controls is not None:
+                            item_info.control_content = controls
+
                     item_info.latent_cache_path = self.get_latent_cache_path(item_info)
 
                     # for VLM, which require image in addition to text, like Qwen-Image-Edit
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
 
                     item_info.fp_latent_window_size = self.fp_latent_window_size
-                    item_info.fp_1f_clean_indices = self.fp_1f_clean_indices
-                    item_info.fp_1f_target_index = self.fp_1f_target_index
+                    if not isinstance(self.datasource, GroupedImageDirectoryDatasource):
+                        item_info.fp_1f_clean_indices = self.fp_1f_clean_indices
+                        item_info.fp_1f_target_index = self.fp_1f_target_index
                     item_info.fp_1f_no_post = self.fp_1f_no_post
 
                     if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
@@ -1581,16 +1893,16 @@ class ImageDataset(BaseDataset):
                             bucket_reso.append(self.fp_1f_no_post)
                         bucket_reso = tuple(bucket_reso)
 
-                    if controls is not None:
-                        item_info.control_content = controls
-                        if (
-                            self.flux_kontext_no_resize_control
-                            or self.qwen_image_edit_no_resize_control
-                            or self.qwen_image_edit_control_resolution is not None
-                        ):
-                            # Add control size to bucket_reso to make different control resolutions to different batch
-                            bucket_reso = list(bucket_reso) + list(controls[0].shape[0:2])
-                            bucket_reso = tuple(bucket_reso)
+                    if not isinstance(self.datasource, GroupedImageDirectoryDatasource):
+                        if controls is not None:
+                            if (
+                                self.flux_kontext_no_resize_control
+                                or self.qwen_image_edit_no_resize_control
+                                or self.qwen_image_edit_control_resolution is not None
+                            ):
+                                # Add control size to bucket_reso to make different control resolutions to different batch
+                                bucket_reso = list(bucket_reso) + list(controls[0].shape[0:2])
+                                bucket_reso = tuple(bucket_reso)
 
                     if bucket_reso not in batches:
                         batches[bucket_reso] = []
@@ -1612,38 +1924,48 @@ class ImageDataset(BaseDataset):
 
         for fetch_op in self.datasource:
             # fetch and resize image in a separate thread
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, Image.Image, str, Optional[Image.Image]]:
-                image_key, image, caption, controls = op()
-                image: Image.Image
-                image_size = image.size
+            def fetch_and_resize(op: callable):
+                if isinstance(self.datasource, GroupedImageDirectoryDatasource):
+                    item_key, target_images, caption, control_images, target_indices, control_indices = op()
+                    image_size = control_images[0].size
+                    bucket_reso = buckset_selector.get_bucket_resolution(image_size)
 
-                bucket_reso = buckset_selector.get_bucket_resolution(image_size)
-                image = resize_image_to_bucket(image, bucket_reso)  # returns np.ndarray
+                    resized_controls = [resize_image_to_bucket(img, bucket_reso) for img in control_images]
+                    resized_targets = [resize_image_to_bucket(img, bucket_reso) for img in target_images]
 
-                resized_controls = None
-                if controls is not None:
-                    resized_controls = []
-                    if self.flux_kontext_no_resize_control or self.qwen_image_edit_no_resize_control:
-                        for control in controls:
-                            # divisible by bucket reso steps
-                            width, height = control.size
-                            width = width - (width % buckset_selector.reso_steps)
-                            height = height - (height % buckset_selector.reso_steps)
-                            resized_control = resize_image_to_bucket(control, (width, height))  # returns np.ndarray
-                            resized_controls.append(resized_control)
-                    elif self.qwen_image_edit_control_resolution is not None:
-                        for control in controls:
-                            control_bucket_reso = BucketSelector.calculate_bucket_resolution(
-                                control.size, self.qwen_image_edit_control_resolution, architecture=self.architecture
-                            )
-                            resized_control = resize_image_to_bucket(control, control_bucket_reso)
-                            resized_controls.append(resized_control)
-                    else:
-                        for control in controls:
-                            resized_control = resize_image_to_bucket(control, bucket_reso)
-                            resized_controls.append(resized_control)
+                    return item_key, resized_targets, caption, resized_controls, target_indices, control_indices
+                else:
+                    image_key, image, caption, controls = op()
+                    image: Image.Image
+                    image_size = image.size
 
-                return image_size, image_key, image, caption, resized_controls
+                    bucket_reso = buckset_selector.get_bucket_resolution(image_size)
+                    image = resize_image_to_bucket(image, bucket_reso)  # returns np.ndarray
+
+                    resized_controls = None
+                    if controls is not None:
+                        resized_controls = []
+                        if self.flux_kontext_no_resize_control or self.qwen_image_edit_no_resize_control:
+                            for control in controls:
+                                # divisible by bucket reso steps
+                                width, height = control.size
+                                width = width - (width % buckset_selector.reso_steps)
+                                height = height - (height % buckset_selector.reso_steps)
+                                resized_control = resize_image_to_bucket(control, (width, height))  # returns np.ndarray
+                                resized_controls.append(resized_control)
+                        elif self.qwen_image_edit_control_resolution is not None:
+                            for control in controls:
+                                control_bucket_reso = BucketSelector.calculate_bucket_resolution(
+                                    control.size, self.qwen_image_edit_control_resolution, architecture=self.architecture
+                                )
+                                resized_control = resize_image_to_bucket(control, control_bucket_reso)
+                                resized_controls.append(resized_control)
+                        else:
+                            for control in controls:
+                                resized_control = resize_image_to_bucket(control, bucket_reso)
+                                resized_controls.append(resized_control)
+
+                    return image_size, image_key, image, caption, resized_controls
 
             future = executor.submit(fetch_and_resize, fetch_op)
             futures.append(future)
@@ -1760,7 +2082,12 @@ class VideoDataset(BaseDataset):
         video_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
+        cache_latents: bool = False,
+        cached_latents_dir: Optional[str] = None,
+        control_indices: Optional[Sequence[int]] = None,
+        target_indices: Optional[Sequence[int]] = None,
         fp_latent_window_size: Optional[int] = 9,
+        enable_relative_positioning: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -1772,9 +2099,12 @@ class VideoDataset(BaseDataset):
             enable_bucket,
             bucket_no_upscale,
             cache_directory,
+            cache_latents,
+            cached_latents_dir,
             debug_dataset,
             architecture,
         )
+        self.multi_frame_training = None
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
         self.control_directory = control_directory
@@ -1783,7 +2113,10 @@ class VideoDataset(BaseDataset):
         self.frame_sample = frame_sample
         self.max_frames = max_frames
         self.source_fps = source_fps
+        self.control_indices = control_indices
+        self.target_indices = target_indices
         self.fp_latent_window_size = fp_latent_window_size
+        self.enable_relative_positioning = enable_relative_positioning
 
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
@@ -1825,7 +2158,15 @@ class VideoDataset(BaseDataset):
             # head extraction. we can limit the number of frames to be extracted
             self.datasource.set_start_and_end_frame(0, max(self.target_frames))
 
-        if self.cache_directory is None:
+        # 階層的なキャッシュディレクトリ解決ロジック
+        # 設計書では `general` と `dataset` での指定を区別するロジックが定義されているが、
+        # `config_utils` からその情報が渡されないため、ここでは `cached_latents_dir` があればそれを優先する、という実装に留める。
+        if self.cached_latents_dir:
+            self.cache_directory = self.cached_latents_dir
+        elif self.cache_directory:
+            # 従来のcache_directoryもフォールバックとして残す
+            pass
+        else:
             self.cache_directory = self.video_directory
 
         self.batch_manager = None
@@ -1847,6 +2188,7 @@ class VideoDataset(BaseDataset):
         metadata["max_frames"] = self.max_frames
         metadata["source_fps"] = self.source_fps
         metadata["has_control"] = self.has_control
+        metadata["enable_relative_positioning"] = self.enable_relative_positioning
         return metadata
 
     def retrieve_latent_cache_batches(self, num_workers: int):
@@ -1946,6 +2288,8 @@ class VideoDataset(BaseDataset):
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
                         item_info.fp_latent_window_size = self.fp_latent_window_size
+                        item_info.control_indices = self.control_indices
+                        item_info.target_indices = self.target_indices
 
                         batch = batches.get(batch_key, [])
                         batch.append(item_info)
@@ -2007,7 +2351,134 @@ class VideoDataset(BaseDataset):
         executor.shutdown()
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
-        return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
+        if not self.multi_frame_training:
+            return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
+
+        # multi_frame_training is enabled
+        buckset_selector = BucketSelector(self.resolution, architecture=self.architecture)
+        self.datasource.set_bucket_selector(buckset_selector)
+        if self.source_fps is not None:
+            self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
+        else:
+            self.datasource.set_source_and_target_fps(None, None)  # no conversion
+
+        executor = ThreadPoolExecutor(max_workers=num_workers)
+
+        data: list[ItemInfo] = []
+        futures = []
+
+        def aggregate_future(consume_all: bool = False):
+            while len(futures) >= num_workers or (consume_all and len(futures) > 0):
+                completed_futures = [future for future in futures if future.done()]
+                if len(completed_futures) == 0:
+                    if len(futures) >= num_workers or consume_all:
+                        time.sleep(0.1)
+                        continue
+                    else:
+                        break
+
+                for future in completed_futures:
+                    original_frame_size, video_key, video, caption, control = future.result()
+
+                    num_total_frames = len(video)
+                    if num_total_frames < 2:
+                        futures.remove(future)
+                        continue
+
+                    # 1. Select control frames
+                    use_specified_controls = (
+                        isinstance(self.multi_frame_training, dict)
+                        and self.multi_frame_training.get("enable_multi_control", False)
+                        and control_indices is not None
+                        and len(control_indices) > 0
+                    )
+
+                    if use_specified_controls:
+                        # Use specified control frames, validating they are within bounds
+                        control_frame_indices = [i for i in control_indices if 0 <= i < num_total_frames]
+                        if not control_frame_indices:
+                            logger.warning(f"Specified control_indices are out of bounds for {video_key}. Skipping.")
+                            futures.remove(future)
+                            continue
+                    else:
+                        # Legacy behavior: randomly select one control frame
+                        control_frame_indices = [random.randint(0, num_total_frames - 1)]
+
+                    # 2. Select target frames
+                    max_frame_distance = self.multi_frame_training["max_frame_distance"]
+                    max_target_frames = self.multi_frame_training["max_target_frames"]
+                    possible_target_indices = set()
+                    for cf_idx in control_frame_indices:
+                        min_target_index = max(0, cf_idx - max_frame_distance)
+                        max_target_index = min(num_total_frames - 1, cf_idx + max_frame_distance)
+                        for i in range(min_target_index, max_target_index + 1):
+                            possible_target_indices.add(i)
+
+                    # Exclude control frames from targets
+                    possible_target_indices -= set(control_frame_indices)
+
+                    if not possible_target_indices:
+                        futures.remove(future)
+                        continue
+
+                    num_target_frames = random.randint(1, min(max_target_frames, len(possible_target_indices)))
+                    target_frame_indices = sorted(random.sample(list(possible_target_indices), num_target_frames))
+
+                    body, ext = os.path.splitext(video_key)
+                    control_indices_str = "_".join([f"{i:05d}" for i in control_frame_indices])
+                    target_indices_str = "_".join([f"{i:05d}" for i in target_frame_indices])
+                    item_key = f"{body}_c_{control_indices_str}_t_{target_indices_str}{ext}"
+
+                    item_info = ItemInfo(item_key, caption, original_frame_size, (0, 0))
+                    item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
+                    data.append(item_info)
+
+                    futures.remove(future)
+
+        def submit_batch(flush: bool = False):
+            nonlocal data
+            if len(data) >= self.batch_size or (len(data) > 0 and flush):
+                batch = data[0 : self.batch_size]
+                if len(data) > self.batch_size:
+                    data = data[self.batch_size :]
+                else:
+                    data = []
+                return batch
+            return None
+
+        for operator in self.datasource:
+
+            def fetch_video(
+                op: callable,
+            ) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
+                result = op()
+                if len(result) == 3:
+                    video_key, video, caption = result
+                    control = None
+                else:
+                    video_key, video, caption, control = result
+
+                video: list[np.ndarray]
+                frame_size = (video[0].shape[1], video[0].shape[0])
+                return frame_size, video_key, video, caption, control
+
+            future = executor.submit(fetch_video, operator)
+            futures.append(future)
+            aggregate_future()
+            while True:
+                batch = submit_batch()
+                if batch is None:
+                    break
+                yield batch
+
+        aggregate_future(consume_all=True)
+        while True:
+            batch = submit_batch(flush=True)
+            if batch is None:
+                break
+            yield batch
+
+        executor.shutdown()
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)

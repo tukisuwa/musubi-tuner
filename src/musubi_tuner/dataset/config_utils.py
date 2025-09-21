@@ -33,8 +33,11 @@ class BaseDatasetParams:
     batch_size: int = 1
     num_repeats: int = 1
     cache_directory: Optional[str] = None
+    cache_latents: bool = False
+    cached_latents_dir: Optional[str] = None
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
+    enable_relative_positioning: bool = False
 
 
 @dataclass
@@ -42,6 +45,12 @@ class ImageDatasetParams(BaseDatasetParams):
     image_directory: Optional[str] = None
     image_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
+    control_image_dir: Optional[str] = None
+    dataset_type: str = "image"
+    control_frame_selection_method: str = "center"
+    control_frame_index: Optional[int] = None
+    control_indices: Optional[Sequence[int]] = None
+    target_indices: Optional[Sequence[int]] = None
 
     # FramePack dependent parameters
     fp_latent_window_size: Optional[int] = 9
@@ -64,6 +73,8 @@ class VideoDatasetParams(BaseDatasetParams):
     frame_sample: Optional[int] = 1
     max_frames: Optional[int] = 129
     source_fps: Optional[float] = None
+    control_indices: Optional[Sequence[int]] = None
+    target_indices: Optional[Sequence[int]] = None
 
     # FramePack dependent parameters
     fp_latent_window_size: Optional[int] = 9
@@ -110,12 +121,21 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
+        "cache_latents": bool,
+        "cached_latents_dir": str,
+        "enable_relative_positioning": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
         "image_jsonl_file": str,
         "cache_directory": str,
         "control_directory": str,
+        "control_image_dir": str,
+        "dataset_type": str,
+        "control_frame_selection_method": str,
+        "control_frame_index": int,
+        "control_indices": [int],
+        "target_indices": [int],
         "fp_latent_window_size": int,
         "fp_1f_clean_indices": [int],
         "fp_1f_target_index": int,
@@ -135,6 +155,8 @@ class ConfigSanitizer:
         "max_frames": int,
         "cache_directory": str,
         "source_fps": float,
+        "control_indices": [int],
+        "target_indices": [int],
         "fp_latent_window_size": int,
     }
 

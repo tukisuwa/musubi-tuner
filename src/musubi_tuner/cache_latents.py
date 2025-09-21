@@ -185,7 +185,11 @@ def preprocess_contents(batch: list[ItemInfo]) -> tuple[int, int, torch.Tensor]:
     contents = []
     content_masks: list[list[Optional[torch.Tensor]]] = []
     for item in batch:
-        item_contents = item.control_content + [item.content]
+        # item.content can be a list of ndarrays (from GroupedImageDirectoryDatasource) or a single ndarray
+        # item.control_content can be a list of ndarrays or None
+        control_content = item.control_content if item.control_content is not None else []
+        target_content = item.content if isinstance(item.content, list) else [item.content]
+        item_contents = control_content + target_content
 
         item_masks = []
         for i, c in enumerate(item_contents):

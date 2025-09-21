@@ -1,18 +1,23 @@
 import argparse
+from datetime import datetime
 import gc
-from importlib.util import find_spec
+import json
 import random
 import os
 import re
 import time
+import math
 import copy
-from typing import Tuple, Optional, List, Any, Dict
+from typing import Tuple, Optional, List, Union, Any, Dict
 
 import torch
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 from PIL import Image
+import cv2
 import numpy as np
+import torchvision.transforms.functional as TF
+from transformers import LlamaModel
 from tqdm import tqdm
 
 from musubi_tuner.networks import lora_framepack
@@ -20,18 +25,23 @@ from musubi_tuner.hunyuan_model.autoencoder_kl_causal_3d import AutoencoderKLCau
 from musubi_tuner.frame_pack import hunyuan
 from musubi_tuner.frame_pack.hunyuan_video_packed import load_packed_model
 from musubi_tuner.frame_pack.hunyuan_video_packed_inference import HunyuanVideoTransformer3DModelPackedInference
-from musubi_tuner.frame_pack.utils import crop_or_pad_yield_mask, soft_append_bcthw
+from musubi_tuner.frame_pack.utils import crop_or_pad_yield_mask, resize_and_center_crop, soft_append_bcthw
+from musubi_tuner.frame_pack.bucket_tools import find_nearest_bucket
 from musubi_tuner.frame_pack.clip_vision import hf_clip_vision_encode
 from musubi_tuner.frame_pack.k_diffusion_hunyuan import sample_hunyuan
 from musubi_tuner.dataset import image_video_dataset
 from musubi_tuner.utils.lora_utils import filter_lora_state_dict
 
-lycoris_available = find_spec("lycoris") is not None
+try:
+    from lycoris.kohya import create_network_from_weights
+except:
+    pass
 
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, save_videos_grid, synchronize_device
 from musubi_tuner.wan_generate_video import merge_lora_weights
 from musubi_tuner.frame_pack.framepack_utils import load_vae, load_text_encoder1, load_text_encoder2, load_image_encoders
+from musubi_tuner.dataset.image_video_dataset import load_video
 
 import logging
 
@@ -87,7 +97,7 @@ class GenerationSettings:
 
 def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Wan 2.1 inference script")
+    parser = argparse.ArgumentParser(description="FramePack video generation script with multi-frame inference support")
 
     # WAN arguments
     # parser.add_argument("--ckpt_dir", type=str, default=None, help="The path to the checkpoint directory (Wan 2.1 official).")
@@ -149,14 +159,32 @@ def parse_args() -> argparse.Namespace:
         help="one frame inference, default is None, comma separated values from 'no_2x', 'no_4x', 'no_post', 'control_indices' and 'target_index'.",
     )
     parser.add_argument(
-        "--control_image_path", type=str, default=None, nargs="*", help="path to control (reference) image for one frame inference."
+        "--control_image_path",
+        type=str,
+        default=None,
+        help="Comma-separated paths to control (reference) images for inference. Recommended to use --multi_frame_inference's `control` key instead.",
     )
     parser.add_argument(
         "--control_image_mask_path",
         type=str,
         default=None,
-        nargs="*",
-        help="path to control (reference) image mask for one frame inference.",
+        help="Comma-separated paths to control (reference) image masks for inference.",
+    )
+    parser.add_argument(
+        "--multi_frame_inference",
+        type=str,
+        default=None,
+        help="Enable multi frame inference mode. e.g. 'target_indices=1;9,control_index=5,enable_interpolation=false,save_interpolated=false,interpolation_threshold=2,3,enable_relative_positioning=true'. "
+        "Note: enable_interpolation defaults to false, save_interpolated defaults to false. "
+        "If save_interpolated=true, enable_interpolation will be automatically set to true. "
+        "interpolation_threshold defaults to '2,3' (past=2, future=3). "
+        "enable_relative_positioning defaults to false (enable relative positioning from control frames).",
+    )
+    parser.add_argument(
+        "--control_indices",
+        type=str,
+        default=None,
+        help="Comma-separated control indices for one frame or multi frame inference. e.g. '1,17'. Recommended to use --multi_frame_inference's `control` key instead.",
     )
     parser.add_argument("--fps", type=int, default=30, help="video fps, default is 30")
     parser.add_argument("--infer_steps", type=int, default=25, help="number of inference steps, default is 25")
@@ -245,9 +273,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    parser.add_argument(
-        "--lycoris", action="store_true", help=f"use lycoris for inference{'' if lycoris_available else ' (not available)'}"
-    )
+    parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
     # parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     # parser.add_argument(
     #     "--compile_args",
@@ -275,6 +301,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
 
+    parser.add_argument(
+        "--randomize_initial_latent",
+        action="store_true",
+        help="Randomize initial latent for i2v, creating a result with high variation from the control image but with reproducibility. Recommended to use --multi_frame_inference's `randomize_latent` key instead.",
+    )
     args = parser.parse_args()
 
     # Validate arguments
@@ -284,9 +315,6 @@ def parse_args() -> argparse.Namespace:
     if args.latent_path is None or len(args.latent_path) == 0:
         if args.prompt is None and not args.from_file and not args.interactive:
             raise ValueError("Either --prompt, --from_file or --interactive must be specified")
-
-    if args.lycoris and not lycoris_available:
-        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
 
     return args
 
@@ -306,9 +334,9 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
 
     # Create dictionary of overrides
     overrides = {"prompt": prompt}
-    # Initialize control_image_path and control_image_mask_path as a list to accommodate multiple paths
-    overrides["control_image_path"] = []
-    overrides["control_image_mask_path"] = []
+    # Initialize control_image_path and control_image_mask_path
+    overrides["control_image_path"] = None
+    overrides["control_image_mask_path"] = None
 
     for part in parts[1:]:
         if not part.strip():
@@ -345,11 +373,15 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
         elif option == "ei":  # end_image_path
             overrides["end_image_path"] = value
         elif option == "ci":  # control_image_path
-            overrides["control_image_path"].append(value)
+            overrides["control_image_path"] = value
         elif option == "cim":  # control_image_mask_path
-            overrides["control_image_mask_path"].append(value)
+            overrides["control_image_mask_path"] = value
         elif option == "of":  # one_frame_inference
             overrides["one_frame_inference"] = value
+        elif option == "cind":  # control_indices
+            overrides["control_indices"] = value
+        elif option == "ei":  # enable_interpolation
+            overrides["enable_interpolation"] = value.lower() == "true"
         # magcache
         elif option == "mcrr":  # magcache retention ratio
             overrides["magcache_retention_ratio"] = float(value)
@@ -358,10 +390,10 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
         elif option == "mck":  # magcache k
             overrides["magcache_k"] = int(value)
 
-    # If no control_image_path was provided, remove the empty list
-    if not overrides["control_image_path"]:
+    # If no control_image_path was provided, remove the key
+    if overrides["control_image_path"] is None:
         del overrides["control_image_path"]
-    if not overrides["control_image_mask_path"]:
+    if overrides["control_image_mask_path"] is None:
         del overrides["control_image_mask_path"]
 
     return overrides
@@ -554,7 +586,7 @@ def decode_latent(
     device: torch.device,
     one_frame_inference_mode: bool = False,
 ) -> torch.Tensor:
-    logger.info("Decoding video...")
+    logger.info(f"Decoding video...")
     if latent.ndim == 4:
         latent = latent.unsqueeze(0)  # add batch dimension
 
@@ -591,7 +623,7 @@ def decode_latent(
             clean_memory_on_device(device)
     else:
         # bulk decode
-        logger.info("Bulk decoding or one frame inference")
+        logger.info(f"Bulk decoding or one frame inference")
         if not one_frame_inference_mode:
             history_pixels = hunyuan.vae_decode(latent, vae).cpu()  # normal
         else:
@@ -651,10 +683,11 @@ def prepare_image_inputs(
         end_image_tensor = None
 
     # check control images
-    if args.control_image_path is not None and len(args.control_image_path) > 0:
+    if args.control_image_path:
+        control_image_paths = [p.strip() for p in args.control_image_path.split(",")]
         control_image_tensors = []
         control_mask_images = []
-        for ctrl_image_path in args.control_image_path:
+        for ctrl_image_path in control_image_paths:
             control_image_tensor, _, control_mask = preprocess_image(ctrl_image_path)
             control_image_tensors.append(control_image_tensor)
             control_mask_images.append(control_mask)
@@ -687,7 +720,7 @@ def prepare_image_inputs(
     clean_memory_on_device(device)
 
     # VAE encoding
-    logger.info("Encoding image to latent space with VAE")
+    logger.info(f"Encoding image to latent space with VAE")
     vae_original_device = vae.device
     vae.to(device)
 
@@ -757,7 +790,7 @@ def prepare_text_inputs(
     text_encoder1_original_device = text_encoder1.device if text_encoder1 else None
     text_encoder2_original_device = text_encoder2.device if text_encoder2 else None
 
-    logger.info("Encoding prompt with Text Encoders")
+    logger.info(f"Encoding prompt with Text Encoders")
     llama_vecs = {}
     llama_attention_masks = {}
     clip_l_poolers = {}
@@ -956,11 +989,11 @@ def convert_lora_for_framepack(lora_sd: dict[str, torch.Tensor]) -> dict[str, to
                 break
 
         if lora_suffix == "lora_A" and prefix is not None:
-            logging.info("Diffusion-pipe (?) LoRA detected, converting to the default LoRA format")
+            logging.info(f"Diffusion-pipe (?) LoRA detected, converting to the default LoRA format")
             lora_sd = convert_lora_from_diffusion_pipe_or_something(lora_sd, "lora_unet_")
 
         else:
-            logging.info("LoRA file format not recognized. Using it as-is.")
+            logging.info(f"LoRA file format not recognized. Using it as-is.")
 
     # Check LoRA is for FramePack or for HunyuanVideo
     is_hunyuan = False
@@ -1125,11 +1158,11 @@ def postprocess_magcache(args: argparse.Namespace, model: HunyuanVideoTransforme
 
     # print mag ratios
     norm_ratio, norm_std, cos_dis = model.get_calibration_data()
-    logger.info("MagCache calibration data:")
+    logger.info(f"MagCache calibration data:")
     logger.info(f"  - norm_ratio: {norm_ratio}")
     logger.info(f"  - norm_std: {norm_std}")
     logger.info(f"  - cos_dis: {cos_dis}")
-    logger.info("Copy and paste following values to --magcache_mag_ratios argument to use them:")
+    logger.info(f"Copy and paste following values to --magcache_mag_ratios argument to use them:")
     print(",".join([f"{ratio:.5f}" for ratio in [1] + norm_ratio]))
 
 
@@ -1157,6 +1190,66 @@ def generate(
     # prepare seed
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
     args.seed = seed  # set seed to args for saving
+
+    # video generation ######
+    f1_mode = args.f1
+    one_frame_inference = None
+    if args.one_frame_inference is not None:
+        one_frame_inference = set()
+        for mode in args.one_frame_inference.split(","):
+            one_frame_inference.add(mode.strip())
+
+    if args.multi_frame_inference is not None:
+        # Parse params for multi_frame_inference
+        params_dict = {}
+        control_indices_str = None
+        control_image_str = None
+
+        # Split by comma, which is the separator for key-value pairs.
+        params = args.multi_frame_inference.split(",")
+
+        for param in params:
+            param = param.strip()
+            if not param or "=" not in param:
+                continue
+
+            key, value = param.split("=", 1)
+            value = value.strip()
+
+            if key == "control_indices":
+                control_indices_str = value
+            elif key == "control_image":
+                control_image_str = value
+            elif key == "randomize_latent":
+                if value.lower() == "true":
+                    args.randomize_initial_latent = True
+                elif value.lower() == "false":
+                    args.randomize_initial_latent = False
+            else:
+                params_dict[key] = value
+
+        # New control format validation and processing
+        if control_indices_str is not None and control_image_str is not None:
+            control_indices = [int(i.strip()) for i in control_indices_str.split(";")]
+            # Handle quoted paths by splitting and then stripping quotes
+            control_images = [p.strip().strip("'\"") for p in control_image_str.split(";")]
+
+            if len(control_indices) != len(control_images):
+                raise ValueError(
+                    f"The number of control_indices ({len(control_indices)}) does not match the number of control_image paths ({len(control_images)})."
+                )
+
+            # Sort by index to maintain order and then override args.
+            # This ensures priority over legacy arguments.
+            sorted_controls = sorted(zip(control_indices, control_images))
+            sorted_indices = [item[0] for item in sorted_controls]
+            sorted_paths = [item[1] for item in sorted_controls]
+
+            args.control_indices = ",".join(map(str, sorted_indices))
+            args.control_image_path = ",".join(sorted_paths)
+        elif control_indices_str is not None or control_image_str is not None:
+            # if only one is provided, it's an error
+            raise ValueError("Both 'control_indices' and 'control_image' must be provided together in --multi_frame_inference.")
 
     if precomputed_image_data is not None and precomputed_text_data is not None:
         logger.info("Using precomputed image and text data.")
@@ -1216,15 +1309,23 @@ def generate(
         f"infer_steps: {args.infer_steps}, frames per generation: {num_frames}"
     )
 
-    # video generation ######
-    f1_mode = args.f1
-    one_frame_inference = None
-    if args.one_frame_inference is not None:
-        one_frame_inference = set()
-        for mode in args.one_frame_inference.split(","):
-            one_frame_inference.add(mode.strip())
-
-    if one_frame_inference is not None:
+    if args.multi_frame_inference is not None:
+        # Simultaneous inference mode
+        real_history_latents = generate_with_simultaneous_multi_frame(
+            args,
+            model,
+            context,
+            context_null,
+            context_img,
+            control_latents,
+            control_mask_images,
+            height,
+            width,
+            device,
+            seed_g,
+            latent_window_size,
+        )
+    elif one_frame_inference is not None:
         real_history_latents = generate_with_one_frame_inference(
             args,
             model,
@@ -1268,7 +1369,7 @@ def generate(
                     print(
                         f"User defined latent paddings length {len(user_latent_paddings)} does not match total sections {total_latent_sections}."
                     )
-                    print("Use default paddings instead for unspecified sections.")
+                    print(f"Use default paddings instead for unspecified sections.")
                     latent_paddings[: len(user_latent_paddings)] = user_latent_paddings
                 elif len(user_latent_paddings) > total_latent_sections:
                     print(
@@ -1417,6 +1518,7 @@ def generate(
                 clean_latent_2x_indices=clean_latent_2x_indices,
                 clean_latents_4x=clean_latents_4x,
                 clean_latent_4x_indices=clean_latent_4x_indices,
+                randomize_initial_latent=args.randomize_initial_latent,
             )
             postprocess_magcache(args, model)
 
@@ -1503,13 +1605,13 @@ def generate_with_one_frame_inference(
         return mask_image
 
     if control_latents is None or len(control_latents) == 0:
-        logger.info("No control images provided for one frame inference. Use zero latents for control images.")
+        logger.info(f"No control images provided for one frame inference. Use zero latents for control images.")
         control_latents = [torch.zeros(1, 16, 1, height // 8, width // 8, dtype=torch.float32)]
 
     if "no_post" not in one_frame_inference:
         # add zero latents as clean latents post
         control_latents.append(torch.zeros((1, 16, 1, height // 8, width // 8), dtype=torch.float32))
-        logger.info("Add zero latents as clean latents post for one frame inference.")
+        logger.info(f"Add zero latents as clean latents post for one frame inference.")
 
     # kisekaeichi and 1f-mc: both are using control images, but indices are different
     clean_latents = torch.cat(control_latents, dim=2)  # (1, 16, num_control_images, H//8, W//8)
@@ -1519,30 +1621,29 @@ def generate_with_one_frame_inference(
 
     for i in range(len(control_latents)):
         mask_image = None
-        if args.control_image_mask_path is not None and i < len(args.control_image_mask_path):
-            mask_image = get_latent_mask(Image.open(args.control_image_mask_path[i]))
-            logger.info(
-                f"Apply mask for clean latents 1x for {i + 1}: {args.control_image_mask_path[i]}, shape: {mask_image.shape}"
-            )
+        if args.control_image_mask_path:
+            mask_paths = [p.strip() for p in args.control_image_mask_path.split(",")]
+            if i < len(mask_paths):
+                mask_image = get_latent_mask(Image.open(mask_paths[i]))
+                logger.info(f"Apply mask for clean latents 1x for {i + 1}: {mask_paths[i]}, shape: {mask_image.shape}")
         elif control_mask_images is not None and i < len(control_mask_images) and control_mask_images[i] is not None:
             mask_image = get_latent_mask(control_mask_images[i])
             logger.info(f"Apply mask for clean latents 1x for {i + 1} with alpha channel: {mask_image.shape}")
         if mask_image is not None:
             clean_latents[:, :, i : i + 1, :, :] = clean_latents[:, :, i : i + 1, :, :] * mask_image
 
+    if args.control_indices:
+        control_indices = [int(x.strip()) for x in args.control_indices.split(",")]
+        for i, control_index in enumerate(control_indices):
+            if i < clean_latent_indices.shape[1]:
+                clean_latent_indices[:, i] = control_index
+        logger.info(f"Set index for clean latent 1x from --control_indices: {control_indices}")
+
     for one_frame_param in one_frame_inference:
         if one_frame_param.startswith("target_index="):
             target_index = int(one_frame_param.split("=")[1])
             latent_indices[:, 0] = target_index
             logger.info(f"Set index for target: {target_index}")
-        elif one_frame_param.startswith("control_index="):
-            control_indices = one_frame_param.split("=")[1].split(";")
-            i = 0
-            while i < len(control_indices) and i < clean_latent_indices.shape[1]:
-                control_index = int(control_indices[i])
-                clean_latent_indices[:, i] = control_index
-                i += 1
-            logger.info(f"Set index for clean latent 1x: {control_indices}")
 
     # "default" option does nothing, so we can skip it
     if "default" in one_frame_inference:
@@ -1551,7 +1652,7 @@ def generate_with_one_frame_inference(
     if "no_2x" in one_frame_inference:
         clean_latents_2x = None
         clean_latent_2x_indices = None
-        logger.info("No clean_latents_2x")
+        logger.info(f"No clean_latents_2x")
     else:
         clean_latents_2x = torch.zeros((1, 16, 2, height // 8, width // 8), dtype=torch.float32)
         index = 1 + latent_window_size + 1
@@ -1560,7 +1661,7 @@ def generate_with_one_frame_inference(
     if "no_4x" in one_frame_inference:
         clean_latents_4x = None
         clean_latent_4x_indices = None
-        logger.info("No clean_latents_4x")
+        logger.info(f"No clean_latents_4x")
     else:
         clean_latents_4x = torch.zeros((1, 16, 16, height // 8, width // 8), dtype=torch.float32)
         index = 1 + latent_window_size + 1 + 2
@@ -1617,12 +1718,254 @@ def generate_with_one_frame_inference(
         clean_latent_2x_indices=clean_latent_2x_indices,
         clean_latents_4x=clean_latents_4x,
         clean_latent_4x_indices=clean_latent_4x_indices,
+        randomize_initial_latent=args.randomize_initial_latent,
     )
 
     postprocess_magcache(args, model)
 
     real_history_latents = generated_latents.to(clean_latents)
     return real_history_latents
+
+
+def generate_with_simultaneous_multi_frame(
+    args: argparse.Namespace,
+    model: HunyuanVideoTransformer3DModelPackedInference,
+    context: Dict[int, Dict[str, torch.Tensor]],
+    context_null: Dict[str, torch.Tensor],
+    context_img: Dict[int, Dict[str, torch.Tensor]],
+    control_latents: Optional[List[torch.Tensor]],
+    control_mask_images: Optional[List[Optional[Image.Image]]],
+    height: int,
+    width: int,
+    device: torch.device,
+    seed_g: torch.Generator,
+    latent_window_size: int,
+) -> torch.Tensor:
+    # 1. 入力の準備とパース
+    params = args.multi_frame_inference.split(",")
+    params_dict = {}
+    for param in params:
+        if "=" in param:
+            key, value = param.strip().split("=", 1)
+            params_dict[key] = value
+
+    target_indices_str = params_dict.get("target_indices", params_dict.get("target_index"))
+    control_indices_str = params_dict.get("control_indices", params_dict.get("control_index"))  # for backward compatibility
+    if args.control_indices:
+        control_indices = [int(x.strip()) for x in args.control_indices.split(",")]
+    elif control_indices_str:
+        logger.warning(
+            "Using 'control_indices' or 'control_index' in --multi_frame_inference is deprecated. Please use --control_indices instead."
+        )
+        control_indices = [int(i.strip()) for i in control_indices_str.split(";")]
+    else:
+        control_indices = []
+
+    if target_indices_str is None or not control_indices:
+        raise ValueError("target_indices and control_indices must be provided for multi_frame_inference.")
+
+    target_indices_list = [int(i.strip()) for i in target_indices_str.split(";")]
+    no_2x = params_dict.get("no_2x", "false").lower() == "true"
+    no_4x = params_dict.get("no_4x", "false").lower() == "true"
+    save_interpolated = params_dict.get("save_interpolated", "false").lower() == "true"
+    enable_interpolation = params_dict.get("enable_interpolation", "false").lower() == "true"
+    enable_relative_positioning = params_dict.get("enable_relative_positioning", "false").lower() == "true"
+
+    # If save_interpolated is True, automatically enable interpolation
+    if save_interpolated:
+        enable_interpolation = True
+
+    # --- 中間フレーム補間ロジック ---
+    original_target_indices = set(target_indices_list)
+    all_indices = sorted(list(original_target_indices | set(control_indices)))
+
+    # Parse interpolation threshold
+    interpolation_threshold_str = params_dict.get("interpolation_threshold", "2,3")
+    threshold_parts = interpolation_threshold_str.split(",")
+    if len(threshold_parts) == 2:
+        threshold_past = int(threshold_parts[0].strip())
+        threshold_future = int(threshold_parts[1].strip())
+    else:
+        threshold_past = threshold_future = int(threshold_parts[0].strip())
+
+    if enable_interpolation:
+        final_indices = []
+        if len(all_indices) > 0:
+            final_indices.append(all_indices[0])
+            for i in range(len(all_indices) - 1):
+                start = all_indices[i]
+                end = all_indices[i+1]
+                dist = end - start
+
+                # コントロールインデックスより過去方向か未来方向かで閾値を変更
+                threshold = threshold_past if start < min(control_indices) else threshold_future
+
+                if dist > threshold:
+                    # 間隔が閾値以下になるように、必要なセグメント数を計算（切り上げ）
+                    num_segments = (dist + (threshold - 1)) // threshold
+                    # linspaceで中間点を生成し、整数に丸める
+                    points = np.linspace(start, end, num_segments + 1).round().astype(int)
+                    # 始点は既に入っているので、それ以外の点を追加
+                    final_indices.extend(points[1:])
+                else:
+                    final_indices.append(end)
+
+        all_indices = sorted(list(set(final_indices)))
+    else:
+        # 補間無効の場合、ターゲットとコントロールのインデックスのみを使用
+        final_indices = all_indices
+
+    pure_control_indices = set(control_indices) - original_target_indices
+    model_target_indices = [idx for idx in all_indices if idx not in pure_control_indices]
+
+    logger.info(f"Original target indices: {target_indices_list}")
+    logger.info(f"Model target indices (with interpolation): {model_target_indices}")
+    # --- ここまで ---
+
+    # 位置情報をコントロールフレームからの相対位置に変換（オプション）
+    if enable_relative_positioning:
+        base_index = min(control_indices)
+        relative_target_indices = [i - base_index for i in model_target_indices]
+        relative_control_indices = [i - base_index for i in control_indices]
+        logger.info(f"Relative positioning enabled. Base index: {base_index}")
+        logger.info(f"Relative target indices: {relative_target_indices}")
+        logger.info(f"Relative control indices: {relative_control_indices}")
+    else:
+        base_index = 0
+        relative_target_indices = model_target_indices
+        relative_control_indices = control_indices
+        logger.info(f"Relative positioning disabled. Using absolute indices.")
+        logger.info(f"Absolute target indices: {relative_target_indices}")
+        logger.info(f"Absolute control indices: {relative_control_indices}")
+
+    latent_indices = torch.tensor([relative_target_indices], dtype=torch.int64)
+    clean_latent_indices = torch.tensor([relative_control_indices], dtype=torch.int64)
+
+    # 2. 参照情報（clean_latents）の準備
+    if control_latents is None or len(control_latents) == 0:
+        logger.warning(f"No control images provided for multi frame inference. Use zero latents for control images.")
+        control_latents = [torch.zeros(1, 16, 1, height // 8, width // 8, dtype=torch.float32)]
+
+    if len(control_latents) != len(control_indices):
+        raise ValueError(
+            f"The number of control_latents ({len(control_latents)}) does not match the number of control_indices ({len(control_indices)})."
+        )
+    clean_latents = torch.cat(control_latents, dim=2)
+
+    logger.info(f"Multi frame inference. target_indices: {target_indices_list}, control_indices: {control_indices}")
+
+    # 2.1. 補助情報（clean_latents_2x, 4x）をゼロで作成
+    height_d = height // 8
+    width_d = width // 8
+    clean_latents_2x = torch.zeros((1, 16, 2, height_d, width_d), dtype=torch.float32)
+    clean_latents_4x = torch.zeros((1, 16, 16, height_d, width_d), dtype=torch.float32)
+
+    # 補助情報のインデックスを定義（one_frame_inferenceと同様の固定値に）
+    if not no_2x:
+        height_d = height // 8
+        width_d = width // 8
+        clean_latents_2x = torch.zeros((1, 16, 2, height_d, width_d), dtype=torch.float32)
+        index = max(control_indices + target_indices_list) + latent_window_size
+        index_2x_start = index
+        clean_latent_2x_indices = torch.arange(index_2x_start, index_2x_start + 2).unsqueeze(0)
+    else:
+        clean_latents_2x = None
+        clean_latent_2x_indices = None
+
+    if not no_4x:
+        height_d = height // 8
+        width_d = width // 8
+        clean_latents_4x = torch.zeros((1, 16, 16, height_d, width_d), dtype=torch.float32)
+        index = max(control_indices + target_indices_list) + latent_window_size + 2
+        index_4x_start = index
+        clean_latent_4x_indices = torch.arange(index_4x_start, index_4x_start + 16).unsqueeze(0)
+    else:
+        clean_latents_4x = None
+        clean_latent_4x_indices = None
+
+    # 3. 同時推論の実行
+    # 3.1. 初期ノイズの生成
+    num_targets = len(model_target_indices)
+    initial_latents = torch.randn(
+        (1, 16, num_targets, height // 8, width // 8),
+        generator=seed_g,
+        device=seed_g.device,
+    ).to(device=device, dtype=torch.float32)
+
+    # prepare conditioning inputs
+    prompt_index = 0
+    image_index = 0
+    context_for_index = context[prompt_index]
+    logger.info(f"Prompt: {context_for_index['prompt']}")
+
+    llama_vec = context_for_index["llama_vec"].to(device, dtype=torch.bfloat16)
+    llama_attention_mask = context_for_index["llama_attention_mask"].to(device)
+    clip_l_pooler = context_for_index["clip_l_pooler"].to(device, dtype=torch.bfloat16)
+    image_encoder_last_hidden_state = context_img[image_index]["image_encoder_last_hidden_state"].to(
+        device, dtype=torch.bfloat16
+    )
+    llama_vec_n = context_null["llama_vec"].to(device, dtype=torch.bfloat16)
+    llama_attention_mask_n = context_null["llama_attention_mask"].to(device)
+    clip_l_pooler_n = context_null["clip_l_pooler"].to(device, dtype=torch.bfloat16)
+
+    preprocess_magcache(args, model)
+
+    generated_latents = sample_hunyuan(
+        transformer=model,
+        sampler=args.sample_solver,
+        initial_latent=initial_latents,
+        width=width,
+        height=height,
+        # frames=1, # not used
+        real_guidance_scale=args.guidance_scale,
+        distilled_guidance_scale=args.embedded_cfg_scale,
+        guidance_rescale=args.guidance_rescale,
+        shift=args.flow_shift,
+        num_inference_steps=args.infer_steps,
+        generator=seed_g,
+        prompt_embeds=llama_vec,
+        prompt_embeds_mask=llama_attention_mask,
+        prompt_poolers=clip_l_pooler,
+        negative_prompt_embeds=llama_vec_n,
+        negative_prompt_embeds_mask=llama_attention_mask_n,
+        negative_prompt_poolers=clip_l_pooler_n,
+        device=device,
+        dtype=torch.bfloat16,
+        image_embeddings=image_encoder_last_hidden_state,
+        latent_indices=latent_indices,
+        clean_latents=clean_latents,
+        clean_latent_indices=clean_latent_indices,
+        clean_latents_2x=clean_latents_2x,
+        clean_latent_2x_indices=clean_latent_2x_indices,
+        clean_latents_4x=clean_latents_4x,
+        clean_latent_4x_indices=clean_latent_4x_indices,
+        randomize_initial_latent=args.randomize_initial_latent,
+    )
+
+    postprocess_magcache(args, model)
+
+    # 4. Latentの並べ替えと出力
+    # 4. Latentの並べ替えと出力
+    if enable_interpolation and save_interpolated:
+        # 補間が有効で、補間フレームを保存する場合
+        sorted_pairs = sorted(zip(model_target_indices, torch.unbind(generated_latents, dim=2)))
+        sorted_latents = torch.stack([item[1] for item in sorted_pairs], dim=2)
+    else:
+        # 補間が無効、または補間フレームを保存しない場合
+        # ユーザーが指定した元のターゲットに対応する結果のみを抽出
+        output_latents = []
+        for i, model_idx in enumerate(model_target_indices):
+            if model_idx in original_target_indices:
+                output_latents.append({
+                    "index": model_idx,
+                    "latent": generated_latents[:, :, i, :, :]
+                })
+
+        # 元のインデックス順にソートして結合
+        sorted_output = sorted(output_latents, key=lambda x: x["index"])
+        sorted_latents = torch.stack([item["latent"] for item in sorted_output], dim=2)
+
+    return sorted_latents
 
 
 def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, width: int) -> str:
@@ -1722,7 +2065,7 @@ def save_images(sample: torch.Tensor, args: argparse.Namespace, original_base_na
     original_name = "" if original_base_name is None else f"_{original_base_name}"
     image_name = f"{time_flag}_{seed}{original_name}"
     sample = sample.unsqueeze(0)
-    one_frame_mode = args.one_frame_inference is not None
+    one_frame_mode = args.one_frame_inference is not None or args.multi_frame_inference is not None
     save_images_grid(sample, save_path, image_name, rescale=True, create_subdir=not one_frame_mode)
     logger.info(f"Sample images saved to: {save_path}/{image_name}")
 
@@ -1762,7 +2105,13 @@ def save_output(
     total_latent_sections = (args.video_seconds * 30) / (args.latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
     video = decode_latent(
-        args.latent_window_size, total_latent_sections, args.bulk_decode, vae, latent, device, args.one_frame_inference is not None
+        args.latent_window_size,
+        total_latent_sections,
+        args.bulk_decode,
+        vae,
+        latent,
+        device,
+        args.one_frame_inference is not None or args.multi_frame_inference is not None,
     )
 
     if args.output_type == "video" or args.output_type == "both":
@@ -1863,7 +2212,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     temp_shared_models_img = {"feature_extractor": feature_extractor_batch, "image_encoder": image_encoder_batch}
 
     for i, prompt_args_item in enumerate(all_prompt_args_list):
-        logger.info(f"Image preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+        logger.info(f"Image preprocessing for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
         # prepare_image_inputs will move vae/image_encoder to device temporarily
         image_data = prepare_image_inputs(prompt_args_item, device, vae_for_batch, temp_shared_models_img)
         all_precomputed_image_data.append(image_data)
@@ -1895,7 +2244,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     }
 
     for i, prompt_args_item in enumerate(all_prompt_args_list):
-        logger.info(f"Text preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+        logger.info(f"Text preprocessing for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
         # prepare_text_inputs will move text_encoders to device temporarily
         text_data = prepare_text_inputs(prompt_args_item, device, temp_shared_models_txt)
         all_precomputed_text_data.append(text_data)
@@ -1927,7 +2276,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
             current_image_data = all_precomputed_image_data[i]
             current_text_data = all_precomputed_text_data[i]
 
-            logger.info(f"Generating latent for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+            logger.info(f"Generating latent for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
             try:
                 # generate is called with precomputed data, so it won't load VAE/Text/Image encoders.
                 # It will use the DiT model from shared_models_for_generate.
@@ -1969,11 +2318,11 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
         for i, latent in enumerate(all_latents):
             if latent is None:  # Skip failed generations
-                logger.warning(f"Skipping decoding for prompt {i + 1} due to previous error.")
+                logger.warning(f"Skipping decoding for prompt {i+1} due to previous error.")
                 continue
 
             current_args = all_prompt_args_list[i]
-            logger.info(f"Decoding output {i + 1}/{len(all_latents)} for prompt: {current_args.prompt}")
+            logger.info(f"Decoding output {i+1}/{len(all_latents)} for prompt: {current_args.prompt}")
 
             # if args.output_type is "both" or "latent_images", we already saved latent above.
             # so we skip saving latent here.

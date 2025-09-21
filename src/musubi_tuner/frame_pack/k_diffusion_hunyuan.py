@@ -57,6 +57,7 @@ def sample_hunyuan(
     device=None,
     negative_kwargs=None,
     callback=None,
+    randomize_initial_latent: bool = False,
     **kwargs,
 ):
     device = device or transformer.device
@@ -64,9 +65,14 @@ def sample_hunyuan(
     if batch_size is None:
         batch_size = int(prompt_embeds.shape[0])
 
-    latents = torch.randn(
-        (batch_size, 16, (frames + 3) // 4, height // 8, width // 8), generator=generator, device=generator.device
-    ).to(device=device, dtype=torch.float32)
+    if initial_latent is not None:
+        latents = torch.randn(initial_latent.shape, generator=generator, device=generator.device).to(
+            device=device, dtype=torch.float32
+        )
+    else:
+        latents = torch.randn(
+            (batch_size, 16, (frames + 3) // 4, height // 8, width // 8), generator=generator, device=generator.device
+        ).to(device=device, dtype=torch.float32)
 
     B, C, T, H, W = latents.shape
     seq_length = T * H * W // 4  # 9*80*80//4 = 14400
@@ -81,10 +87,16 @@ def sample_hunyuan(
     k_model = fm_wrapper(transformer)
 
     if initial_latent is not None:
-        sigmas = sigmas * strength
-        first_sigma = sigmas[0].to(device=device, dtype=torch.float32)
-        initial_latent = initial_latent.to(device=device, dtype=torch.float32)
-        latents = initial_latent.float() * (1.0 - first_sigma) + latents.float() * first_sigma
+        if randomize_initial_latent:
+            latents = torch.randn(initial_latent.shape, generator=generator, device=generator.device).to(
+                device=device, dtype=torch.float32
+            )
+            initial_latent = None  # Skip the strength-based mixing
+        else:
+            sigmas = sigmas * strength
+            first_sigma = sigmas[0].to(device=device, dtype=torch.float32)
+            initial_latent = initial_latent.to(device=device, dtype=torch.float32)
+            latents = initial_latent.float() * (1.0 - first_sigma) + latents.float() * first_sigma
 
     if concat_latent is not None:
         concat_latent = concat_latent.to(latents)

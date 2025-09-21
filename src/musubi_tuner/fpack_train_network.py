@@ -39,6 +39,20 @@ class FramePackNetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
 
+    def prepare_dataset(self, args: argparse.Namespace) -> None:
+        super().prepare_dataset(args)
+
+        if args.multi_frame_training:
+            datasets = []
+            if isinstance(self.dataset_config, image_video_dataset.DatasetGroup):
+                datasets.extend(self.dataset_config.datasets)
+            else:
+                datasets.append(self.dataset_config)
+
+            for dataset in datasets:
+                if isinstance(dataset, image_video_dataset.VideoDataset):
+                    dataset.multi_frame_training = args.multi_frame_training
+
     # region model specific
 
     @property
@@ -589,11 +603,22 @@ def framepack_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument(
         "--vae_spatial_tile_sample_min_size", type=int, default=None, help="spatial tile sample min size for VAE, default 256"
     )
-    parser.add_argument("--image_encoder", type=str, required=True, help="Image encoder (CLIP) checkpoint path or directory")
+    parser.add_argument("--image_encoder", type=str, help="Image encoder (CLIP) checkpoint path or directory")
     parser.add_argument("--latent_window_size", type=int, default=9, help="FramePack latent window size (default 9)")
     parser.add_argument("--bulk_decode", action="store_true", help="decode all frames at once in sample generation")
     parser.add_argument("--f1", action="store_true", help="Use F1 sampling method for sample generation")
     parser.add_argument("--one_frame", action="store_true", help="Use one frame sampling method for sample generation")
+    parser.add_argument(
+        "--multi_frame_training",
+        type=str,
+        default=None,
+        help='Enable multi-frame training mode with parameters, e.g., "num_control_frames=1,max_target_frames=4,max_frame_distance=32"',
+    )
+    parser.add_argument(
+        "--enable_multi_control_frame_training",
+        action="store_true",
+        help="Enable multi-control-frame training. Use specified `control_indices` in metadata if available.",
+    )
     return parser
 
 
@@ -603,10 +628,21 @@ def main():
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+    args = read_config_from_file(args, parser)
 
-    assert args.vae_dtype is None or args.vae_dtype == "float16", (
-        "VAE dtype must be float16 / VAEのdtypeはfloat16でなければなりません"
-    )
+    if args.multi_frame_training:
+        params = {}
+        for p in args.multi_frame_training.split(","):
+            key, value = p.split("=")
+            params[key.strip()] = int(value.strip())
+        args.multi_frame_training = params
+        args.multi_frame_training["enable_multi_control"] = args.enable_multi_control_frame_training
+    else:
+        args.multi_frame_training = None
+
+    assert (
+        args.vae_dtype is None or args.vae_dtype == "float16"
+    ), "VAE dtype must be float16 / VAEのdtypeはfloat16でなければなりません"
     args.vae_dtype = "float16"  # fixed
     args.dit_dtype = "bfloat16"  # fixed
     args.sample_solver = "unipc"  # for sample generation, fixed to unipc

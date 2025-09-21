@@ -76,19 +76,19 @@ def process_text_encoder_batches(
     batch_size: int,
     datasets: list[BaseDataset],
     all_cache_files_for_dataset: list[set],
-    all_cache_paths_for_dataset: list[set],
     encode: callable,
     requires_content: Optional[bool] = False,
 ):
     """
     Architecture independent processing of text encoder batches.
     """
+    all_cache_paths_for_dataset = []
 
     num_workers = num_workers if num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_cache_files = all_cache_files_for_dataset[i]
-        all_cache_paths = all_cache_paths_for_dataset[i]
+        all_cache_paths = set()
 
         if not requires_content:
             batches = dataset.retrieve_text_encoder_output_cache_batches(num_workers)  # return captions only
@@ -104,7 +104,7 @@ def process_text_encoder_batches(
             # skip existing cache files
             if skip_existing:
                 filtered_batch = [
-                    item for item in batch if os.path.normpath(item.text_encoder_output_cache_path) not in all_cache_files
+                    item for item in batch if not os.path.normpath(item.text_encoder_output_cache_path) in all_cache_files
                 ]
                 # print(f"Filtered {len(batch) - len(filtered_batch)} existing cache files")
                 if len(filtered_batch) == 0:
@@ -114,6 +114,8 @@ def process_text_encoder_batches(
             bs = batch_size if batch_size is not None else len(batch)
             for i in range(0, len(batch), bs):
                 encode(batch[i : i + bs])
+        all_cache_paths_for_dataset.append(all_cache_paths)
+    return all_cache_paths_for_dataset
 
 
 def post_process_cache_files(

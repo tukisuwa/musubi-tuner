@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import torch
 from transformers import LlamaTokenizerFast, LlamaModel, CLIPTokenizer, CLIPTextModel
@@ -47,6 +48,8 @@ def encode_and_save_batch(
         batch, list_of_llama_vec, list_of_llama_attention_mask, list_of_clip_l_pooler
     ):
         # save llama_vec and clip_l_pooler to cache
+        print(f"Saving cache for item {item.item_key} at {item.text_encoder_output_cache_path}")
+        print(f"  llama_vec: {llama_vec.shape}, llama_attention_mask: {llama_attention_mask.shape}, clip_l_pooler: {clip_l_pooler.shape}")
         save_text_encoder_output_cache_framepack(item, llama_vec, llama_attention_mask, clip_l_pooler)
 
 
@@ -63,13 +66,27 @@ def main():
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
     logger.info(f"Load dataset config from {args.dataset_config}")
     user_config = config_utils.load_user_config(args.dataset_config)
-    blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_FRAMEPACK)
+    # multi_frame_training for VideoDataset
+    multi_frame_training_config = {}
+    if args.multi_frame_training:
+        for item in args.multi_frame_training.split(","):
+            key, value = item.split("=")
+            multi_frame_training_config[key.strip()] = int(value.strip())
+
+    blueprint = blueprint_generator.generate(
+        user_config, args, architecture=ARCHITECTURE_FRAMEPACK, multi_frame_training=multi_frame_training_config
+    )
     train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
     datasets = train_dataset_group.datasets
 
     # prepare cache files and paths: all_cache_files_for_dataset = exisiting cache files, all_cache_paths_for_dataset = all cache paths in the dataset
-    all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
+    # prepare cache files and paths: all_cache_files_for_dataset = exisiting cache files, all_cache_paths_for_dataset = all cache paths in the dataset
+    all_cache_files_for_dataset = []
+    for dataset in datasets:
+        all_cache_files = [os.path.normpath(file) for file in dataset.get_all_text_encoder_output_cache_files()]
+        all_cache_files = set(all_cache_files)
+        all_cache_files_for_dataset.append(all_cache_files)
 
     # load text encoder
     tokenizer1, text_encoder1 = load_text_encoder1(args, args.fp8_llm, device)
@@ -82,26 +99,29 @@ def main():
     def encode_for_text_encoder(batch: list[ItemInfo]):
         encode_and_save_batch(tokenizer1, text_encoder1, tokenizer2, text_encoder2, batch, device)
 
-    cache_text_encoder_outputs.process_text_encoder_batches(
+    all_cache_paths_for_dataset = cache_text_encoder_outputs.process_text_encoder_batches(
         args.num_workers,
         args.skip_existing,
         args.batch_size,
         datasets,
         all_cache_files_for_dataset,
-        all_cache_paths_for_dataset,
         encode_for_text_encoder,
     )
 
     # remove cache files not in dataset
-    cache_text_encoder_outputs.post_process_cache_files(
-        datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache
-    )
+    cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache)
 
 
 def framepack_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--text_encoder1", type=str, required=True, help="Text Encoder 1 directory")
     parser.add_argument("--text_encoder2", type=str, required=True, help="Text Encoder 2 directory")
     parser.add_argument("--fp8_llm", action="store_true", help="use fp8 for Text Encoder 1 (LLM)")
+    parser.add_argument(
+        "--multi_frame_training",
+        type=str,
+        default=None,
+        help="Enable multi-frame training for VideoDataset. e.g. 'max_target_frames=3,max_frame_distance=50'",
+    )
     return parser
 
 
