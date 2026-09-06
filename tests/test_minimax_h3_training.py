@@ -26,6 +26,8 @@ from musubi_tuner.minimax_h3_train_network import (
     _decomposed_flow_loss,
     _normalize_h3_sample_parameter,
     _prediction_geometry_log,
+    _runtime_batch_plan,
+    _validate_reference_route,
     minimax_h3_setup_parser,
 )
 from musubi_tuner.training.sampling_prompts import line_to_prompt_dict
@@ -232,12 +234,51 @@ def test_h3_parser_defaults_to_the_only_supported_training_coordinates():
     assert args.h3_shift_audio == 3.0
     assert args.h3_visual_cond_clean == 0.999
     assert args.h3_audio_cond_clean == 1.0
+    assert args.h3_independent_target_roles is False
+    assert args.h3_target_noise_coupling == "independent"
+    assert args.h3_reference_route == "native"
+    assert args.h3_target_frame_indices is None
+    assert args.h3_visual_condition_frame_indices is None
     assert args.network_module == "networks.lora_minimax_h3"
     assert args.video_only is False
     assert args.audio_loss_weight == 1.0
     assert args.convrot_int8 is False
     assert args.convrot_int8_bwd == "bf16"
     assert "--h3_video_only" not in parser.format_help()
+
+
+def test_h3_trainer_parses_indexed_mfi_coordinates_for_training_and_metadata():
+    trainer = MiniMaxH3NetworkTrainer()
+    args = _trainer_args(h3_target_frame_indices="-3,2", h3_visual_condition_frame_indices="0")
+
+    trainer.handle_model_specific_args(args)
+
+    assert args.h3_target_frame_indices == (-3, 2)
+    assert args.h3_visual_condition_frame_indices == (0,)
+    assert trainer.extra_metadata(args)["ss_minimax_h3_target_frame_indices"] == "-3,2"
+    assert trainer.extra_metadata(args)["ss_minimax_h3_visual_condition_frame_indices"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("route", "with_reference", "token_tags", "expected_layout"),
+    [
+        ("dual", True, [1, 0, 1], "ref2va"),
+        ("qwen_image_only", False, [1, 0, 1], "t2va"),
+        ("dit_latent_only", True, [1, 1, 1], "ref2va"),
+        ("text_only", False, [1, 1, 1], "t2va"),
+    ],
+)
+def test_reference_route_contract(route, with_reference, token_tags, expected_layout):
+    args = _trainer_args(task="ref2va", h3_reference_route=route, video_only=True)
+    batch = _training_batch()
+    batch["mmh3_token_tags"] = [torch.tensor(token_tags, dtype=torch.int64)]
+    if with_reference:
+        batch["latents_ref_000_image"] = torch.zeros(1, 24, 1, 4, 4)
+    runtime = _runtime_batch_plan(batch, torch.zeros(1, 24, 2, 4, 4))
+
+    _validate_reference_route(runtime, args)
+
+    assert runtime.layout.task == expected_layout
 
 
 def test_h3_parser_accepts_int8_convrot_backward_mode():
@@ -1407,6 +1448,11 @@ def test_h3_training_metadata_records_task_scheduler_and_target_policy():
         "ss_minimax_h3_supervised_audio_fraction": 0.25,
         "ss_minimax_h3_audio_loss_weight": 1.0,
         "ss_minimax_h3_video_only": False,
+        "ss_minimax_h3_independent_target_roles": False,
+        "ss_minimax_h3_target_noise_coupling": "independent",
+        "ss_minimax_h3_reference_route": "native",
+        "ss_minimax_h3_target_frame_indices": "default",
+        "ss_minimax_h3_visual_condition_frame_indices": "default",
         "ss_minimax_h3_target_modules": "attn.qkv_proj,attn.out_proj,mlp.fc1,mlp.fc2",
         "ss_minimax_h3_convrot_int8": False,
         "ss_minimax_h3_latent_cache_version": "2",

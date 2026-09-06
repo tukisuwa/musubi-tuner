@@ -98,6 +98,18 @@ def _one_frame_time_overrides(args: argparse.Namespace) -> H3TimeOverrides | Non
     )
 
 
+def _parse_mfi_indices(value: str | None, label: str) -> tuple[int, ...] | None:
+    if value is None or value == "":
+        return None
+    parts = tuple(part.strip() for part in value.split(","))
+    if not parts or any(not part for part in parts):
+        raise ValueError(f"MiniMax-H3 --{label} must be a comma-separated integer list")
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError as error:
+        raise ValueError(f"MiniMax-H3 --{label} must contain only integers") from error
+
+
 def _require_path(value: str | None, label: str) -> Path:
     if not value:
         raise ValueError(f"MiniMax-H3 generation requires --{label}")
@@ -184,7 +196,23 @@ def validate_prompt_args(args: argparse.Namespace, *, directory_output: bool = F
     """Validate per-prompt arguments; with directory_output the output path is an auto-named directory."""
     if args.width <= 0 or args.height <= 0 or args.width % 32 or args.height % 32:
         raise ValueError(f"MiniMax-H3 width and height must be positive and divisible by 32, got {args.width}x{args.height}")
-    one_frame = args.frame_count == 1
+    mfi = bool(getattr(args, "h3_independent_target_roles", False))
+    target_indices = _parse_mfi_indices(getattr(args, "h3_target_frame_indices", None), "h3_target_frame_indices")
+    condition_indices = _parse_mfi_indices(
+        getattr(args, "h3_visual_condition_frame_indices", None), "h3_visual_condition_frame_indices"
+    )
+    if mfi:
+        if not target_indices:
+            raise ValueError("MiniMax-H3 indexed MFI requires --h3_target_frame_indices")
+        if args.output_type not in {"latent", "images", "latent_images"}:
+            raise ValueError("MiniMax-H3 indexed MFI requires --output_type latent, images, or latent_images")
+        if args.one_frame is not None or args.output_fps != TARGET_FPS or args.stretch_keep_bands:
+            raise ValueError("MiniMax-H3 indexed MFI does not combine with one-frame options or temporal stretch")
+        if args.trajectory_dir:
+            raise ValueError("MiniMax-H3 indexed MFI does not support trajectory decoding")
+    elif target_indices is not None or condition_indices is not None:
+        raise ValueError("MiniMax-H3 explicit MFI indices require --h3_independent_target_roles")
+    one_frame = args.frame_count == 1 and not mfi
     # fps above the native rate would let the duration gate admit packed sequences far past
     # the released maximum (and desynchronize the floored audio count), so the squeeze
     # direction stays closed until it is validated
@@ -214,7 +242,7 @@ def validate_prompt_args(args: argparse.Namespace, *, directory_output: bool = F
                 )
         elif control_indices is not None:
             raise ValueError("MiniMax-H3 --one_frame control_index applies only to FL2VA conditions")
-    else:
+    elif not mfi:
         if args.one_frame is not None:
             raise ValueError("MiniMax-H3 --one_frame options require --frame_count 1")
         video_latent_frames(args.frame_count)
@@ -706,7 +734,12 @@ def _encode_conditions(
 
 
 def _build_layout(args: argparse.Namespace, text_length: int, visual_geometries, reference_geometries):
-    one_frame = args.frame_count == 1
+    mfi = bool(getattr(args, "h3_independent_target_roles", False))
+    target_indices = _parse_mfi_indices(getattr(args, "h3_target_frame_indices", None), "h3_target_frame_indices")
+    condition_indices = _parse_mfi_indices(
+        getattr(args, "h3_visual_condition_frame_indices", None), "h3_visual_condition_frame_indices"
+    )
+    one_frame = args.frame_count == 1 and not mfi
     condition_roles = None
     if args.task == "fl2va":
         condition_roles = tuple(role for role, path in (("first", args.first_frame), ("last", args.last_frame)) if path)
@@ -714,16 +747,21 @@ def _build_layout(args: argparse.Namespace, text_length: int, visual_geometries,
         task=args.task,
         text_length=text_length,
         target_video=H3VideoGeometry(
-            ONE_FRAME_VIDEO_LATENT_FRAMES if one_frame else video_latent_frames(args.frame_count),
+            len(target_indices) if mfi else (ONE_FRAME_VIDEO_LATENT_FRAMES if one_frame else video_latent_frames(args.frame_count)),
             args.height // VIDEO_VAE_SPATIAL_RATIO,
             args.width // VIDEO_VAE_SPATIAL_RATIO,
         ),
         target_audio_frames=(
-            ONE_FRAME_AUDIO_LATENT_FRAMES if one_frame else audio_latent_frames(args.frame_count, output_fps=args.output_fps)
+            ONE_FRAME_AUDIO_LATENT_FRAMES
+            if mfi or one_frame
+            else audio_latent_frames(args.frame_count, output_fps=args.output_fps)
         ),
         visual_conditions=visual_geometries,
         references=reference_geometries,
         one_frame=one_frame,
+        independent_target_roles=mfi,
+        target_frame_indices=target_indices,
+        visual_condition_frame_indices=condition_indices,
         condition_roles=condition_roles,
         time_overrides=_one_frame_time_overrides(args),
         output_fps=args.output_fps,
@@ -805,6 +843,7 @@ def _sample_latents(
         device=device,
         video_dtype=torch.float32,
         audio_dtype=torch.float32,
+        video_noise_coupling=getattr(args, "h3_target_noise_coupling", "independent"),
     )
     visual_conditions, audio_conditions = augment_condition_latents(
         visual_conditions,
@@ -858,9 +897,26 @@ def _decode_and_save(
     trajectory_dir: Path | None = None,
     trajectory_schedule=None,
 ) -> Path:
-    one_frame = args.frame_count == 1
+    mfi = bool(getattr(args, "h3_independent_target_roles", False))
+    one_frame = args.frame_count == 1 and not mfi
     logger.info("Decoding MiniMax-H3 video")
     with _borrowed_video_vae(args, device, VIDEO_VAE_DECODE_DTYPE, shared) as video_vae:
+        if mfi:
+            output_path = Path(output_path)
+            output_path.mkdir(parents=True, exist_ok=True)
+            target_indices = _parse_mfi_indices(args.h3_target_frame_indices, "h3_target_frame_indices")
+            with torch.no_grad():
+                for slot, frame_index in enumerate(target_indices):
+                    decoded = video_vae.decode(
+                        video_latents[:, :, slot : slot + 1].to(device=device, dtype=VIDEO_VAE_DECODE_DTYPE)
+                    ).cpu()
+                    write_image(
+                        decoded_video_to_uint8(decoded, frame_limit=1)[0],
+                        output_path / f"{slot:03d}_index_{frame_index:+d}.png",
+                    )
+                    del decoded
+            logger.info("Saved MiniMax-H3 indexed MFI outputs: %s", output_path)
+            return output_path
         with torch.no_grad():
             decoded_video = video_vae.decode(video_latents.to(device=device, dtype=VIDEO_VAE_DECODE_DTYPE)).cpu()
         if trajectory_dir is not None and trajectory:
@@ -993,6 +1049,11 @@ def _save_latent_file(
         "h3_shift_video": str(args.h3_shift_video),
         "h3_shift_audio": str(args.h3_shift_audio),
     }
+    if getattr(args, "h3_independent_target_roles", False):
+        metadata["h3_independent_target_roles"] = "true"
+        metadata["h3_target_frame_indices"] = args.h3_target_frame_indices
+        metadata["h3_visual_condition_frame_indices"] = args.h3_visual_condition_frame_indices or "default"
+        metadata["h3_target_noise_coupling"] = args.h3_target_noise_coupling
     path.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(path), metadata=metadata)
     logger.info("Saved MiniMax-H3 latents: %s", path)
@@ -1092,7 +1153,8 @@ def run_generation(
     directory_output: bool = False,
 ) -> Path:
     validate_prompt_args(args, directory_output=directory_output)
-    one_frame = args.frame_count == 1
+    mfi = bool(getattr(args, "h3_independent_target_roles", False))
+    one_frame = args.frame_count == 1 and not mfi
     if device is None:
         device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     decoder = decoder or PyAVH3MediaDecoder()
@@ -1123,7 +1185,7 @@ def run_generation(
         shared=shared,
         x0_callback=x0_callback,
     )
-    if one_frame:
+    if one_frame or mfi:
         # the 2-frame audio target is a byproduct of the joint layout, not an output
         audio_latents = None
     output_path = _resolve_output_path(args, seed, directory_mode=directory_output)
@@ -1484,6 +1546,27 @@ def setup_parser() -> argparse.ArgumentParser:
         " places the generated frame; control_index places the FL2VA condition frames in --first_frame/--last_frame"
         " order and is required when conditions are present. The base model reads these as trainable time inputs;"
         " see docs/minimax_h3_1f.md",
+    )
+    parser.add_argument(
+        "--h3_independent_target_roles",
+        action="store_true",
+        help="indexed MFI mode: generate independent semantic target slices and decode each slice as a PNG",
+    )
+    parser.add_argument(
+        "--h3_target_frame_indices",
+        default=None,
+        help="indexed MFI: comma-separated signed pixel-frame indices, one per generated target slice",
+    )
+    parser.add_argument(
+        "--h3_visual_condition_frame_indices",
+        default=None,
+        help="indexed MFI: comma-separated signed pixel-frame indices, one per clean visual condition",
+    )
+    parser.add_argument(
+        "--h3_target_noise_coupling",
+        choices=("independent", "shared"),
+        default="independent",
+        help="indexed MFI: noise covariance across target-role slices",
     )
     parser.add_argument(
         "--output_fps",

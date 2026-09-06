@@ -76,6 +76,7 @@ logger = logging.getLogger(__name__)
 
 
 _RUNTIME_REF_KEY = re.compile(r"^latents_ref_(\d{3})_(image|video|audio)$")
+_REFERENCE_ROUTES = {"native", "dual", "qwen_image_only", "dit_latent_only", "text_only"}
 
 
 def _require_sampling_path(value: str | None, label: str) -> Path:
@@ -258,6 +259,32 @@ def _stack_single_text_rows(value, label: str) -> torch.Tensor:
     return value[0].unsqueeze(0)
 
 
+def _parse_target_frame_indices(value: Any) -> tuple[int, ...] | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        parts = tuple(part.strip() for part in value.split(","))
+        if not parts or any(not part for part in parts):
+            raise ValueError("--h3_target_frame_indices must be a comma-separated integer list")
+        try:
+            return tuple(int(part) for part in parts)
+        except ValueError as error:
+            raise ValueError("--h3_target_frame_indices must contain only integers") from error
+    if isinstance(value, Sequence):
+        values = tuple(value)
+        if any(type(item) is not int for item in values):
+            raise ValueError("--h3_target_frame_indices must contain only integers")
+        return values
+    raise ValueError("--h3_target_frame_indices must be a comma-separated integer list")
+
+
+def _parse_visual_condition_frame_indices(value: Any) -> tuple[int, ...] | None:
+    try:
+        return _parse_target_frame_indices(value)
+    except ValueError as error:
+        raise ValueError(str(error).replace("--h3_target_frame_indices", "--h3_visual_condition_frame_indices")) from error
+
+
 _coinciding_one_frame_indices_warned = False
 
 
@@ -329,6 +356,9 @@ def _runtime_batch_plan(
     *,
     teacher_conditions: str | None = None,
     one_frame: bool = False,
+    independent_target_roles: bool = False,
+    target_frame_indices: Sequence[int] | None = None,
+    visual_condition_frame_indices: Sequence[int] | None = None,
 ) -> _H3RuntimeBatch:
     if video_latents.ndim != 5 or video_latents.shape[1] != 24:
         raise ValueError(f"MiniMax-H3 target video latents must be [B,24,F,H,W], got {tuple(video_latents.shape)}")
@@ -371,7 +401,7 @@ def _runtime_batch_plan(
     one_frame_index_value = batch.get("one_frame_target_index")
     one_frame_control_value = batch.get("one_frame_control_indices")
     time_overrides = None
-    if is_one_frame_batch:
+    if is_one_frame_batch and not independent_target_roles:
         if not one_frame:
             raise ValueError("MiniMax-H3 batch carries a one-frame latent cache; pass --one_frame to train on image targets")
         if reference_roles or teacher_conditions is not None:
@@ -408,7 +438,7 @@ def _runtime_batch_plan(
         elif one_frame_control_value is not None:
             raise ValueError("MiniMax-H3 one-frame T2VA batch cannot carry one_frame_control_indices; re-run latent caching")
         time_overrides = H3TimeOverrides(condition_times=condition_times, target_time=FRAME_RESCALE * target_index)
-    elif one_frame_index_value is not None or one_frame_control_value is not None:
+    elif not independent_target_roles and (one_frame_index_value is not None or one_frame_control_value is not None):
         raise ValueError("MiniMax-H3 video batch cannot carry one-frame index tensors; re-run latent caching")
 
     visual_conditions = []
@@ -531,7 +561,7 @@ def _runtime_batch_plan(
     else:
         task = "t2va"
 
-    if is_one_frame_batch and task == "fl2va" and len(condition_geometries) != len(time_overrides.condition_times):
+    if is_one_frame_batch and not independent_target_roles and task == "fl2va" and len(condition_geometries) != len(time_overrides.condition_times):
         raise ValueError(
             f"MiniMax-H3 one-frame FL2VA batch has {len(condition_geometries)} condition latents for"
             f" {len(time_overrides.condition_times)} control indices; re-run latent caching"
@@ -543,8 +573,11 @@ def _runtime_batch_plan(
         target_audio_frames=audio_latents.shape[-1],
         visual_conditions=tuple(condition_geometries),
         references=tuple(references),
-        one_frame=is_one_frame_batch,
-        condition_roles=fl_condition_roles if is_one_frame_batch else None,
+        one_frame=is_one_frame_batch and not independent_target_roles,
+        independent_target_roles=independent_target_roles,
+        target_frame_indices=target_frame_indices,
+        visual_condition_frame_indices=visual_condition_frame_indices,
+        condition_roles=fl_condition_roles if is_one_frame_batch and not independent_target_roles else None,
         time_overrides=time_overrides,
     )
     return _H3RuntimeBatch(
@@ -562,6 +595,36 @@ def _runtime_batch_plan(
     )
 
 
+def _validate_reference_route(runtime: _H3RuntimeBatch, args: argparse.Namespace) -> None:
+    """Validate whether Qwen vision rows and DiT reference rows match the selected route."""
+    route = getattr(args, "h3_reference_route", "native")
+    if route == "native":
+        expected_task = args.task
+    else:
+        if args.task != "ref2va":
+            raise ValueError("--h3_reference_route experiments require the Ref2VA base family (--task ref2va)")
+        expected_task = "ref2va" if route in {"dual", "dit_latent_only"} else "t2va"
+
+    if runtime.layout.task != expected_task:
+        if route == "native":
+            raise ValueError(
+                f"MiniMax-H3 --task {args.task} does not match the authoritative {runtime.layout.task.upper()} cache layout"
+            )
+        raise ValueError(
+            f"MiniMax-H3 reference route {route!r} expects a {expected_task.upper()} cache layout, "
+            f"got {runtime.layout.task.upper()}"
+        )
+
+    if route == "native":
+        return
+    vision_rows = int((runtime.text_token_tags == 0).sum().item())
+    expects_qwen_image = route in {"dual", "qwen_image_only"}
+    if expects_qwen_image and vision_rows == 0:
+        raise ValueError(f"MiniMax-H3 reference route {route!r} requires Qwen vision rows")
+    if not expects_qwen_image and vision_rows != 0:
+        raise ValueError(
+            f"MiniMax-H3 reference route {route!r} requires a caption-only Qwen cache, got {vision_rows} vision rows"
+        )
 def _shift_noise_amount(base: torch.Tensor, shift: float) -> torch.Tensor:
     return shift * base / (1.0 + (shift - 1.0) * base)
 
@@ -719,6 +782,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self.default_discrete_flow_shift = 1.0
         if getattr(args, "task", None) not in {"t2va", "fl2va", "ref2va"}:
             raise ValueError("MiniMax-H3 requires --task t2va, fl2va, or ref2va")
+        reference_route = getattr(args, "h3_reference_route", "native")
+        if reference_route not in _REFERENCE_ROUTES:
+            raise ValueError(f"unsupported MiniMax-H3 reference route: {reference_route}")
+        if reference_route != "native" and args.task != "ref2va":
+            raise ValueError("--h3_reference_route experiments require --task ref2va")
+        args.h3_target_frame_indices = _parse_target_frame_indices(
+            getattr(args, "h3_target_frame_indices", None)
+        )
+        args.h3_visual_condition_frame_indices = _parse_visual_condition_frame_indices(
+            getattr(args, "h3_visual_condition_frame_indices", None)
+        )
+        if getattr(args, "h3_independent_target_roles", False):
+            if getattr(args, "one_frame", False):
+                raise ValueError("--h3_independent_target_roles uses indexed caches and cannot combine with --one_frame")
+            if getattr(args, "h3_teacher_matching", False):
+                raise ValueError("--h3_independent_target_roles does not support --h3_teacher_matching")
         if getattr(args, "one_frame", False):
             if args.task not in {"t2va", "fl2va"}:
                 raise ValueError("MiniMax-H3 one-frame training requires --task t2va or fl2va")
@@ -1229,6 +1308,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_minimax_h3_audio_supervision": "presence_gated_training_weight",
             "ss_minimax_h3_audio_loss_weight": args.audio_loss_weight,
             "ss_minimax_h3_video_only": args.video_only,
+            "ss_minimax_h3_independent_target_roles": bool(getattr(args, "h3_independent_target_roles", False)),
+            "ss_minimax_h3_target_noise_coupling": getattr(args, "h3_target_noise_coupling", "independent"),
+            "ss_minimax_h3_reference_route": getattr(args, "h3_reference_route", "native"),
+            "ss_minimax_h3_target_frame_indices": (
+                "default"
+                if _parse_target_frame_indices(getattr(args, "h3_target_frame_indices", None)) is None
+                else ",".join(str(value) for value in _parse_target_frame_indices(args.h3_target_frame_indices))
+            ),
+            "ss_minimax_h3_visual_condition_frame_indices": (
+                "default"
+                if _parse_visual_condition_frame_indices(
+                    getattr(args, "h3_visual_condition_frame_indices", None)
+                )
+                is None
+                else ",".join(
+                    str(value)
+                    for value in _parse_visual_condition_frame_indices(args.h3_visual_condition_frame_indices)
+                )
+            ),
             "ss_minimax_h3_target_modules": "attn.qkv_proj,attn.out_proj,mlp.fc1,mlp.fc2",
             "ss_minimax_h3_convrot_int8": getattr(self, "_convrot_int8_active", args.convrot_int8),
             "ss_minimax_h3_latent_cache_version": "2",
@@ -1633,11 +1731,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             latents,
             teacher_conditions=teacher_conditions,
             one_frame=bool(getattr(args, "one_frame", False)),
+            independent_target_roles=bool(getattr(args, "h3_independent_target_roles", False)),
+            target_frame_indices=_parse_target_frame_indices(getattr(args, "h3_target_frame_indices", None)),
+            visual_condition_frame_indices=_parse_visual_condition_frame_indices(
+                getattr(args, "h3_visual_condition_frame_indices", None)
+            ),
         )
         self._audio_items_seen += int(runtime.audio_present.numel())
         self._audio_supervised_seen += int(runtime.audio_present.sum().item())
-        if runtime.layout.task != args.task:
-            raise ValueError(f"MiniMax-H3 --task {args.task} cannot train a {runtime.layout.task.upper()} cache batch")
+        _validate_reference_route(runtime, args)
         device = latents.device
         audio_latents = batch["latents_audio"].to(device=device)
         audio_noise = torch.randn_like(audio_latents)
@@ -1655,6 +1757,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         sigma_audio = _shift_noise_amount(base, args.h3_shift_audio)
         model_t_video = 1.0 - sigma_video
         model_t_audio = 1.0 - sigma_audio
+        # Local import keeps lightweight parser-only consumers from needing the full
+        # sampling surface while still sharing the inference/training noise contract.
+        from musubi_tuner.minimax_h3.sampling import couple_target_video_noise
+
+        noise = couple_target_video_noise(noise, getattr(args, "h3_target_noise_coupling", "independent"))
         noisy_video = (1.0 - sigma_video) * latents + sigma_video * noise
         noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
 
@@ -1781,6 +1888,38 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         " minimax_h3_cache_latents.py --one_frame — plain image targets (t2va) or editing/inbetween targets"
         " with 1-2 time-annotated control images (fl2va). Video batches are unaffected, so image and video"
         " datasets can mix in one run",
+    )
+    parser.add_argument(
+        "--h3_independent_target_roles",
+        action="store_true",
+        help="treat each target latent slice as an independent semantic role instead of a chronological H3 video",
+    )
+    parser.add_argument(
+        "--h3_target_noise_coupling",
+        choices=("independent", "shared"),
+        default="independent",
+        help="noise covariance across independent target-role slices",
+    )
+    parser.add_argument(
+        "--h3_reference_route",
+        choices=tuple(sorted(_REFERENCE_ROUTES)),
+        default="native",
+        help=(
+            "reference-route contract for Ref2VA MFI training; qwen_image_only/text_only use a reference-free "
+            "packed layout, while dit_latent_only/text_only require caption-only Qwen caches"
+        ),
+    )
+    parser.add_argument(
+        "--h3_target_frame_indices",
+        type=str,
+        default=None,
+        help="comma-separated signed pixel-frame indices, one per target latent slice",
+    )
+    parser.add_argument(
+        "--h3_visual_condition_frame_indices",
+        type=str,
+        default=None,
+        help="comma-separated signed pixel-frame indices, one per clean visual condition",
     )
     add_audio_train_args(parser)
     parser.add_argument("--h3_shift_video", type=float, default=12.0, help="MiniMax-H3 target-video flow shift")

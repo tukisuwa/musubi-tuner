@@ -138,6 +138,10 @@ class H3PackedLayout:
     references: tuple[H3ReferenceGeometry, ...]
     segments: tuple[H3RowSegment, ...]
     row_count: int
+    # Indexed MFI keeps semantic target slices and clean visual conditions on an
+    # explicit shared pixel-frame coordinate system. None preserves native H3 time.
+    target_frame_indices: tuple[int, ...] | None = None
+    visual_condition_frame_indices: tuple[int, ...] | None = None
     # part of the frozen layout value so the transformer's layout-keyed rotary cache
     # cannot serve a grid built for different times
     time_overrides: H3TimeOverrides | None = None
@@ -262,6 +266,9 @@ def build_h3_layout(
     visual_conditions: Sequence[H3VideoGeometry | Sequence[int]] = (),
     references: Sequence[H3ReferenceGeometry] = (),
     one_frame: bool = False,
+    independent_target_roles: bool = False,
+    target_frame_indices: Sequence[int] | None = None,
+    visual_condition_frame_indices: Sequence[int] | None = None,
     condition_roles: Sequence[str] | None = None,
     time_overrides: H3TimeOverrides | None = None,
     output_fps: int = TARGET_FPS,
@@ -273,6 +280,8 @@ def build_h3_layout(
         raise ValueError(f"MiniMax-H3 text length must be positive, got {text_length}")
     if isinstance(output_fps, bool) or not isinstance(output_fps, int) or output_fps <= 0:
         raise ValueError(f"MiniMax-H3 output fps must be a positive integer, got {output_fps!r}")
+    if one_frame and independent_target_roles:
+        raise ValueError("MiniMax-H3 one-frame and independent target-role layouts are distinct modes")
     if one_frame and output_fps != TARGET_FPS:
         raise ValueError("MiniMax-H3 one-frame layouts do not support temporal stretch")
     temporal_fine_bands = int(temporal_fine_bands)
@@ -281,7 +290,16 @@ def build_h3_layout(
     if temporal_fine_bands and output_fps == TARGET_FPS:
         raise ValueError("MiniMax-H3 temporal fine bands require an active temporal stretch")
     target_video = _coerce_video_geometry(target_video, "target video")
-    if one_frame:
+    if independent_target_roles:
+        if target_video.frames <= 0:
+            raise ValueError("MiniMax-H3 independent target roles require at least one target latent slice")
+        if target_audio_frames <= 0:
+            raise ValueError("MiniMax-H3 independent target roles require a positive audio placeholder length")
+        if output_fps != TARGET_FPS or temporal_fine_bands:
+            raise ValueError("MiniMax-H3 independent target roles do not support temporal stretch")
+        if time_overrides is not None:
+            raise ValueError("MiniMax-H3 independent target roles use frame indices, not one-frame time overrides")
+    elif one_frame:
         if target_video.frames != ONE_FRAME_VIDEO_LATENT_FRAMES:
             raise ValueError(f"MiniMax-H3 one-frame layout requires a single target latent frame, got {target_video.frames}")
         if target_audio_frames != ONE_FRAME_AUDIO_LATENT_FRAMES:
@@ -299,6 +317,16 @@ def build_h3_layout(
                 f"MiniMax-H3 target audio has {target_audio_frames} frames, expected {expected_audio_frames} "
                 f"for {target_video.frames} video latent frames at {output_fps} fps"
             )
+
+    if target_frame_indices is not None:
+        target_frame_indices = tuple(target_frame_indices)
+        if len(target_frame_indices) != target_video.frames:
+            raise ValueError(
+                "MiniMax-H3 target_frame_indices must have one integer per target latent slice: "
+                f"expected {target_video.frames}, got {len(target_frame_indices)}"
+            )
+        if any(type(value) is not int for value in target_frame_indices):
+            raise TypeError("MiniMax-H3 target_frame_indices must contain only integers")
 
     visual_conditions = tuple(
         _coerce_video_geometry(condition, f"visual condition {index}") for index, condition in enumerate(visual_conditions)
@@ -328,6 +356,25 @@ def build_h3_layout(
             raise ValueError("MiniMax-H3 Ref2VA layout requires ordered references and no FL2VA conditions")
         if not any(reference.kind in {"image", "video"} for reference in references):
             raise ValueError("MiniMax-H3 Ref2VA layout requires at least one visual reference")
+
+    visual_condition_count = (
+        len(visual_conditions)
+        if task == "fl2va"
+        else sum(reference.kind in {"image", "video"} for reference in references)
+    )
+    if visual_condition_frame_indices is not None:
+        visual_condition_frame_indices = tuple(visual_condition_frame_indices)
+        if len(visual_condition_frame_indices) != visual_condition_count:
+            raise ValueError(
+                "MiniMax-H3 visual_condition_frame_indices must have one integer per visual condition: "
+                f"expected {visual_condition_count}, got {len(visual_condition_frame_indices)}"
+            )
+        if any(type(value) is not int for value in visual_condition_frame_indices):
+            raise TypeError("MiniMax-H3 visual_condition_frame_indices must contain only integers")
+        if task == "ref2va" and any(reference.kind != "image" for reference in references):
+            raise ValueError(
+                "MiniMax-H3 explicit visual condition indices currently support image-only Ref2VA references"
+            )
     if time_overrides is not None and task != "fl2va" and time_overrides.condition_times:
         raise ValueError(f"MiniMax-H3 {task} time overrides cannot carry condition times")
 
@@ -362,6 +409,8 @@ def build_h3_layout(
         text_length=text_length,
         target_video=target_video,
         target_audio_frames=target_audio_frames,
+        target_frame_indices=target_frame_indices,
+        visual_condition_frame_indices=visual_condition_frame_indices,
         visual_conditions=visual_conditions,
         references=references,
         segments=tuple(segments),
@@ -413,6 +462,17 @@ def _video_grid(video: H3VideoGeometry, cursor: float, temporal_stretch: float =
     return grid.reshape(-1, 3)
 
 
+def _indexed_video_grid(video: H3VideoGeometry, indices: Sequence[int], cursor: float) -> torch.Tensor:
+    """Place independent latent slices at explicit signed pixel-frame indices."""
+    frame, _ = _frame_grid(video)
+    grid = torch.empty(video.frames, frame.shape[0], 3, dtype=torch.float64)
+    grid[..., 0] = (
+        float(cursor) + FRAME_RESCALE * torch.tensor(tuple(indices), dtype=torch.float64)
+    )[:, None]
+    grid[..., 1:] = frame[None]
+    return grid.reshape(-1, 3)
+
+
 def _audio_grid(cursor: float, frames: int, width_low: float, width_high: float) -> torch.Tensor:
     grid = torch.zeros(frames * STEREO_CHANNELS, 3, dtype=torch.float64)
     grid[:, 0] = (cursor + torch.arange(frames, dtype=torch.float64)).repeat(STEREO_CHANNELS)
@@ -433,7 +493,11 @@ def build_position_grid(layout: H3PackedLayout, *, device: torch.device | str | 
 
     if layout.task == "fl2va":
         condition_segments = tuple(segment for segment in layout.segments if segment.kind == "visual_condition")
-        if layout.time_overrides is not None:
+        if layout.visual_condition_frame_indices is not None:
+            condition_times = [
+                cursor + FRAME_RESCALE * index for index in layout.visual_condition_frame_indices
+            ]
+        elif layout.time_overrides is not None:
             condition_times = [cursor + time for time in layout.time_overrides.condition_times]
         else:
             # the last-frame anchor sits on the final pixel frame of the target timeline,
@@ -445,14 +509,21 @@ def build_position_grid(layout: H3PackedLayout, *, device: torch.device | str | 
             positions[segment.row_slice, 0] = time
             positions[segment.row_slice, 1:] = target_frame
     elif layout.task == "ref2va":
+        visual_index = 0
         for index, reference in enumerate(layout.references):
             prefix = f"ref_{index:03d}"
             if reference.kind == "image":
                 segment = layout.segment(f"{prefix}_image")
                 frame, _ = _frame_grid(reference.video)
-                positions[segment.row_slice, 0] = cursor
+                positions[segment.row_slice, 0] = (
+                    cursor
+                    if layout.visual_condition_frame_indices is None
+                    else cursor + FRAME_RESCALE * layout.visual_condition_frame_indices[visual_index]
+                )
                 positions[segment.row_slice, 1:] = frame
-                cursor += 1.0
+                visual_index += 1
+                if layout.visual_condition_frame_indices is None:
+                    cursor += 1.0
             elif reference.kind == "audio":
                 segment = layout.segment(f"{prefix}_audio")
                 positions[segment.row_slice] = _audio_grid(cursor, reference.audio_frames, *target_width_endpoints)
@@ -469,6 +540,7 @@ def build_position_grid(layout: H3PackedLayout, *, device: torch.device | str | 
                     )
                 video = layout.segment(f"{prefix}_video")
                 positions[video.row_slice] = _video_grid(reference.video, cursor)
+                visual_index += 1
                 cursor += max(float(reference.audio_frames), sum(_video_t_spans(reference.video.frames)))
 
     if layout.time_overrides is not None:
@@ -480,7 +552,12 @@ def build_position_grid(layout: H3PackedLayout, *, device: torch.device | str | 
         *target_width_endpoints,
     )
     target_video = layout.target_video_segment
-    positions[target_video.row_slice] = _video_grid(layout.target_video, cursor, layout.temporal_stretch)
+    if layout.target_frame_indices is None:
+        positions[target_video.row_slice] = _video_grid(layout.target_video, cursor, layout.temporal_stretch)
+    else:
+        positions[target_video.row_slice] = _indexed_video_grid(
+            layout.target_video, layout.target_frame_indices, cursor
+        )
     positions = positions.unsqueeze(0)
     return positions.to(device=device) if device is not None else positions
 

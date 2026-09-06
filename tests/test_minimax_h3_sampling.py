@@ -11,10 +11,11 @@ from safetensors.torch import save_file
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from musubi_tuner.minimax_h3.packing import H3VideoGeometry, build_h3_layout
+from musubi_tuner.minimax_h3.packing import H3ReferenceGeometry, H3VideoGeometry, build_h3_layout
 from musubi_tuner.minimax_h3.sampling import (
     augment_condition_latents,
     build_shifted_schedule,
+    couple_target_video_noise,
     create_sampling_generator,
     decode_joint_av,
     initialize_target_latents,
@@ -25,6 +26,7 @@ from musubi_tuner.minimax_h3.generation_inputs import load_generation_record, pa
 from musubi_tuner.minimax_h3.packing import FRAME_RESCALE, H3TimeOverrides
 from musubi_tuner.minimax_h3.sampling import write_image
 from musubi_tuner.minimax_h3_generate_video import (
+    _build_layout,
     _one_frame_time_overrides,
     load_cached_text_conditioning,
     validate_generation_args,
@@ -77,6 +79,38 @@ def test_target_initialization_draws_video_then_audio_from_one_request_generator
 
     assert torch.equal(video, expected_video)
     assert torch.equal(audio, expected_audio)
+
+
+def test_shared_target_initialization_broadcasts_one_slice_without_changing_audio_rng():
+    shared_video, shared_audio = initialize_target_latents(
+        video_shape=(1, 24, 3, 4, 4),
+        audio_shape=(1, 32, 2, 8),
+        generator=create_sampling_generator(124),
+        device=torch.device("cpu"),
+        video_dtype=torch.float32,
+        audio_dtype=torch.float32,
+        video_noise_coupling="shared",
+    )
+    independent_video, independent_audio = initialize_target_latents(
+        video_shape=(1, 24, 3, 4, 4),
+        audio_shape=(1, 32, 2, 8),
+        generator=create_sampling_generator(124),
+        device=torch.device("cpu"),
+        video_dtype=torch.float32,
+        audio_dtype=torch.float32,
+    )
+
+    assert torch.equal(shared_video[:, :, 0], independent_video[:, :, 0])
+    assert torch.equal(shared_video[:, :, 0], shared_video[:, :, 1])
+    assert torch.equal(shared_video[:, :, 1], shared_video[:, :, 2])
+    assert torch.equal(shared_audio, independent_audio)
+
+
+def test_target_noise_coupling_rejects_bad_shape_and_mode():
+    with pytest.raises(ValueError, match=r"\[B,C,F,H,W\]"):
+        couple_target_video_noise(torch.zeros(1, 2, 3), "shared")
+    with pytest.raises(ValueError, match="coupling"):
+        couple_target_video_noise(torch.zeros(1, 24, 3, 4, 4), "correlated")
 
 
 def test_condition_augmentation_draws_visuals_then_audio_from_the_same_request_stream():
@@ -304,6 +338,10 @@ def _generation_args(tmp_path, *, task="t2va", **overrides):
         "reference_index": 0,
         "ref": None,
         "one_frame": None,
+        "h3_independent_target_roles": False,
+        "h3_target_frame_indices": None,
+        "h3_visual_condition_frame_indices": None,
+        "h3_target_noise_coupling": "independent",
         "width": 64,
         "height": 64,
         "frame_count": 124,
@@ -463,6 +501,41 @@ def test_generation_validation_gates_the_one_frame_mode(tmp_path):
         )
     with pytest.raises(ValueError, match="requires --first_frame and/or --last_frame"):
         validate_generation_args(_generation_args(tmp_path, task="fl2va", frame_count=1, output=png, one_frame="control_index=0"))
+
+
+def test_generation_validation_and_layout_support_indexed_mfi(tmp_path):
+    args = _generation_args(
+        tmp_path,
+        task="ref2va",
+        ref=["face.png"],
+        output=str(tmp_path / "outputs"),
+        output_type="images",
+        h3_independent_target_roles=True,
+        h3_target_frame_indices="-1,0,1",
+        h3_visual_condition_frame_indices="0",
+    )
+
+    validate_generation_args(args)
+    layout = _build_layout(
+        args,
+        text_length=3,
+        visual_geometries=(),
+        reference_geometries=(H3ReferenceGeometry("image", video=H3VideoGeometry(1, 2, 2)),),
+    )
+
+    assert layout.target_video.frames == 3
+    assert layout.target_frame_indices == (-1, 0, 1)
+    assert layout.visual_condition_frame_indices == (0,)
+
+    with pytest.raises(ValueError, match="requires --h3_target_frame_indices"):
+        validate_generation_args(
+            _generation_args(
+                tmp_path,
+                output=str(tmp_path / "outputs"),
+                output_type="images",
+                h3_independent_target_roles=True,
+            )
+        )
 
 
 def test_mux_encodes_above_the_1mbps_pyav_default(tmp_path):

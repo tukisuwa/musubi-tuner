@@ -94,6 +94,7 @@ def initialize_target_latents(
     device: torch.device | str,
     video_dtype: torch.dtype = torch.float16,
     audio_dtype: torch.dtype = torch.float32,
+    video_noise_coupling: str = "independent",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     video_shape = tuple(int(value) for value in video_shape)
     audio_shape = tuple(int(value) for value in audio_shape)
@@ -103,7 +104,19 @@ def initialize_target_latents(
         raise ValueError(f"MiniMax-H3 target audio noise shape must be [B,32,2,A], got {audio_shape}")
     video = torch.randn(video_shape, generator=generator, dtype=torch.float32, device="cpu").to(device=device, dtype=video_dtype)
     audio = torch.randn(audio_shape, generator=generator, dtype=torch.float32, device="cpu").to(device=device, dtype=audio_dtype)
+    video = couple_target_video_noise(video, video_noise_coupling)
     return video, audio
+
+
+def couple_target_video_noise(noise: torch.Tensor, mode: str) -> torch.Tensor:
+    """Set target-slice covariance while preserving every slice's N(0,I) marginal."""
+    if noise.ndim != 5:
+        raise ValueError(f"MiniMax-H3 target video noise must be [B,C,F,H,W], got {tuple(noise.shape)}")
+    if mode == "independent":
+        return noise
+    if mode == "shared":
+        return noise[:, :, :1].expand_as(noise).clone()
+    raise ValueError(f"Unsupported MiniMax-H3 target video noise coupling: {mode!r}")
 
 
 def _augment_condition_group(

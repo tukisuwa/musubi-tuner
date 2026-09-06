@@ -163,6 +163,35 @@ def test_layout_rejects_target_audio_that_does_not_match_video_duration():
         )
 
 
+def test_layout_allows_explicit_independent_three_role_targets_only_with_opt_in():
+    target = H3VideoGeometry(3, 4, 4)
+    reference = (H3ReferenceGeometry("image", video=H3VideoGeometry(1, 4, 4)),)
+    with pytest.raises(ValueError, match=r"5\*n\+2"):
+        build_h3_layout(
+            task="ref2va",
+            text_length=3,
+            target_video=target,
+            target_audio_frames=8,
+            references=reference,
+            target_frame_indices=(-1, 0, 1),
+            visual_condition_frame_indices=(0,),
+        )
+
+    layout = build_h3_layout(
+        task="ref2va",
+        text_length=3,
+        target_video=target,
+        target_audio_frames=8,
+        references=reference,
+        independent_target_roles=True,
+        target_frame_indices=(-1, 0, 1),
+        visual_condition_frame_indices=(0,),
+    )
+
+    assert layout.target_frame_indices == (-1, 0, 1)
+    assert layout.visual_condition_frame_indices == (0,)
+
+
 def test_timestep_plan_preserves_text_tags_and_uses_final_layer_time_indices_directly():
     layout = build_h3_layout(
         task="fl2va",
@@ -278,6 +307,40 @@ def test_position_grid_uses_the_full_five_frame_temporal_cycle():
     expected = 1.0 + torch.cat((torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)))
 
     torch.testing.assert_close(video_times, expected, rtol=0, atol=0)
+
+
+def test_position_grid_places_targets_and_reference_on_one_signed_time_origin():
+    layout = build_h3_layout(
+        task="ref2va",
+        text_length=2,
+        target_video=H3VideoGeometry(3, 4, 4),
+        target_audio_frames=8,
+        references=(H3ReferenceGeometry("image", video=H3VideoGeometry(1, 4, 4)),),
+        independent_target_roles=True,
+        target_frame_indices=(-1, 0, 1),
+        visual_condition_frame_indices=(0,),
+    )
+
+    positions = build_position_grid(layout)
+    reference_times = positions[0, layout.segment("ref_000_image").row_slice, 0]
+    target_times = positions[0, layout.target_video_segment.row_slice, 0].reshape(3, -1)
+    expected = torch.tensor([2.0 - FRAME_RESCALE, 2.0, 2.0 + FRAME_RESCALE], dtype=torch.float64)
+
+    torch.testing.assert_close(reference_times, torch.full_like(reference_times, 2.0), rtol=0, atol=0)
+    torch.testing.assert_close(target_times, expected[:, None].expand_as(target_times), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("indices", ((0,), (0, 1.5)))
+def test_layout_rejects_invalid_explicit_target_indices(indices):
+    error = ValueError if len(indices) != TARGET_VIDEO.frames else TypeError
+    with pytest.raises(error, match="target_frame_indices"):
+        build_h3_layout(
+            task="t2va",
+            text_length=1,
+            target_video=TARGET_VIDEO,
+            target_audio_frames=8,
+            target_frame_indices=indices,
+        )
 
 
 def test_position_grid_matches_mixed_reference_cursor_order():
