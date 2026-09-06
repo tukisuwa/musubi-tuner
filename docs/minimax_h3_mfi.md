@@ -1,6 +1,6 @@
 # MiniMax-H3 indexed multi-frame inference (MFI)
 
-This branch adds an experimental, opt-in H3 layout for generating several independent image roles in one DiT call. It is intended for tasks such as producing `highlight`, `base`, and `shadow` layers from one reference image.
+This branch adds an experimental, opt-in H3 layout for generating several independent image roles in one DiT call.
 
 MFI uses one shared coordinate contract:
 
@@ -10,7 +10,7 @@ noisy target roles:      {(latent, signed pixel-frame index)}
 model output:             target rows only
 ```
 
-The indices are MM-RoPE coordinates, not built-in semantic labels. `-1` does not intrinsically mean highlight. Role meaning is learned from the paired targets, stable tensor order, indices, reference route, and noise policy together.
+The indices are MM-RoPE coordinates, not built-in semantic labels. MFI does not prescribe a role set, role count, tensor order, or index assignment. Those meanings are learned from the paired targets and are defined by the training contract together with the stable tensor order, indices, reference route, and noise policy.
 
 ## Generation
 
@@ -24,17 +24,17 @@ python minimax_h3_generate_video.py \
   --audio_vae /path/to/audio_vae.safetensors \
   --text_encoder /path/to/qwen3-vl \
   --ref /path/to/reference.png \
-  --prompt "separate the illustration into editable lighting layers" \
-  --lora_weight /path/to/three_layer_lora.safetensors \
+  --prompt "generate the jointly trained output roles" \
+  --lora_weight /path/to/multi_role_lora.safetensors \
   --width 512 --height 512 --steps 20 --seed 1 \
   --h3_independent_target_roles \
-  --h3_target_frame_indices=-1,0,1 \
+  --h3_target_frame_indices=-3,2 \
   --h3_visual_condition_frame_indices=0 \
   --h3_target_noise_coupling independent \
   --output_type latent_images --output outputs/mfi
 ```
 
-The PNG names preserve slot and index, for example `000_index_-1.png`, `001_index_+0.png`, and `002_index_+1.png`. `--frame_count` is not used to size an MFI target; the number of target indices determines its latent length.
+The PNG names preserve slot and index; with the example above they are `000_index_-3.png` and `001_index_+2.png`. `--frame_count` is not used to size an MFI target; the number of target indices determines its latent length.
 
 `shared` target noise broadcasts the first target slice's initial noise to every role. It preserves each slice's standard-normal marginal but changes cross-role covariance. Models trained with `independent` noise should normally be inferred with `independent` noise.
 
@@ -46,7 +46,7 @@ The training cache must expose:
 - a positive-length audio placeholder and `audio_present=0` for image-only training;
 - reference latent rows and Qwen vision rows consistent with the selected reference route.
 
-Example training flags for three joint roles are:
+Example training flags for two joint roles are:
 
 ```bash
 accelerate launch -m musubi_tuner.minimax_h3_train_network \
@@ -55,7 +55,7 @@ accelerate launch -m musubi_tuner.minimax_h3_train_network \
   --video_only --mixed_precision bf16 \
   --network_module networks.lora_minimax_h3 --network_dim 8 --network_alpha 8 \
   --h3_independent_target_roles \
-  --h3_target_frame_indices=-1,0,1 \
+  --h3_target_frame_indices=-3,2 \
   --h3_visual_condition_frame_indices=0 \
   --h3_target_noise_coupling independent \
   --h3_reference_route dual
