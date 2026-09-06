@@ -23,6 +23,8 @@ from musubi_tuner.dataset.architectures import (
 )
 from musubi_tuner.minimax_h3.audio_vae import load_audio_vae
 from musubi_tuner.minimax_h3.generation_inputs import (
+    route_task,
+    route_text_record,
     VIDEO_VAE_SPATIAL_RATIO,
     build_reference_geometries,
     decode_generation_visuals,
@@ -90,6 +92,7 @@ def _require_sampling_path(value: str | None, label: str) -> Path:
 
 def _normalize_h3_sample_parameter(args: argparse.Namespace, parameter: dict[str, Any]) -> dict[str, Any]:
     sample = parameter.copy()
+    sample["h3_reference_route"] = getattr(args, "h3_reference_route", "native")
     sample_task = sample.get("task", args.task)
     if sample_task != args.task:
         raise ValueError(f"MiniMax-H3 sample prompt task {sample_task!r} does not match the training --task {args.task!r}")
@@ -172,14 +175,16 @@ def _normalize_h3_sample_parameter(args: argparse.Namespace, parameter: dict[str
             raise ValueError("MiniMax-H3 FL2VA training sample requires a prompt")
         if reference_jsonl or ref_specs:
             raise ValueError("MiniMax-H3 FL2VA training sample does not accept reference_jsonl or --ref")
-        if frame_count == 1 and not mfi:
+        if mfi or frame_count == 1:
             # mirror the generation rules: any subset of first/last, one control_index per
             # provided frame (mandatory — the placement is the training signal)
             if not first_frame and not last_frame:
                 raise ValueError("MiniMax-H3 one-frame FL2VA training sample requires first_frame and/or last_frame")
             provided_frames = int(bool(first_frame)) + int(bool(last_frame))
-            control_indices = sample.get("one_frame_control_indices")
+            control_indices = sample.get("h3_visual_condition_frame_indices") if mfi else sample.get("one_frame_control_indices")
             if control_indices is None or len(control_indices) != provided_frames:
+                if mfi:
+                    raise ValueError("MFI FL2VA sample requires one --h3_visual_condition_frame_indices entry per provided frame")
                 raise ValueError(
                     "MiniMax-H3 one-frame FL2VA training sample requires --of control_index with one entry"
                     " per provided frame, e.g. --of target_index=24,control_index=0"
@@ -190,6 +195,9 @@ def _normalize_h3_sample_parameter(args: argparse.Namespace, parameter: dict[str
         else:
             _require_sampling_path(first_frame, "first_frame")
             _require_sampling_path(last_frame, "last_frame")
+    elif getattr(args, "h3_reference_route", "native") == "text_only" and not ref_specs and not reference_jsonl:
+        if not prompt or first_frame or last_frame:
+            raise ValueError("H3 text_only sample requires a prompt and no first/last frames")
     else:
         if first_frame or last_frame:
             raise ValueError("MiniMax-H3 Ref2VA training sample does not accept first/last frames")
@@ -994,7 +1002,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 request = SimpleNamespace(**parameter)
                 record = load_generation_record(request)
                 raw_visuals, text_visuals = decode_generation_visuals(request, record, decoder)
-                presentation = build_presentation(record, args.task, text_visuals)
+                presentation = build_presentation(route_text_record(args, record), route_task(args, "text"), text_visuals)
                 hidden_states, token_tags = encode_h3_presentation(processor, text_encoder, presentation)
                 parameter["h3_text_hidden_states"] = hidden_states.to(torch.bfloat16).unsqueeze(0).cpu()
                 parameter["h3_text_token_tags"] = token_tags.unsqueeze(0).cpu()
@@ -1006,7 +1014,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             clean_memory_on_device(device)
 
         logger.info("Loading MiniMax-H3 video VAE for training samples")
-        has_visual_conditions = args.task != "t2va"
+        has_visual_conditions = route_task(args, "dit") != "t2va"
         video_vae_device = device if has_visual_conditions else torch.device("cpu")
         video_vae = load_video_vae(
             args.video_vae,
@@ -1019,7 +1027,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if video_vae.vae_ratio != VIDEO_VAE_SPATIAL_RATIO:
                 raise ValueError(f"MiniMax-H3 video VAE spatial ratio must be {VIDEO_VAE_SPATIAL_RATIO}, got {video_vae.vae_ratio}")
             for parameter in parameters:
-                if args.task == "t2va":
+                if route_task(args, "dit") == "t2va":
                     parameter["h3_visual_conditions"] = ()
                     parameter["_h3_visual_geometries"] = ()
                     parameter["_h3_reference_visual_geometries"] = {}
@@ -1089,13 +1097,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     parameter["_h3_reference_visual_geometries"],
                     parameter["_h3_reference_audio_frames"],
                 )
-                if args.task == "ref2va"
+                if route_task(args, "dit") == "ref2va"
                 else ()
             )
             mfi = bool(getattr(args, "h3_independent_target_roles", False))
             one_frame_sample = parameter["frame_count"] == 1 and not mfi
             condition_roles = None
             time_overrides = None
+            if mfi and args.task == "fl2va":
+                condition_roles = tuple(role for role, key in (("first", "first_frame"), ("last", "last_frame")) if parameter.get(key))
             if one_frame_sample:
                 # roles follow the provided frames (mirrors the generation CLI); condition
                 # times come from --of control_index, one per provided frame
@@ -1111,7 +1121,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     target_time=FRAME_RESCALE * parameter["one_frame_target_index"],
                 )
             parameter["h3_layout"] = build_h3_layout(
-                task=args.task,
+                task=route_task(args, "dit"),
                 text_length=parameter["h3_text_hidden_states"].shape[1],
                 target_video=H3VideoGeometry(
                     len(parameter["h3_target_frame_indices"]) if mfi else (ONE_FRAME_VIDEO_LATENT_FRAMES if one_frame_sample else video_latent_frames(parameter["frame_count"])),
@@ -1126,7 +1136,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 one_frame=one_frame_sample,
                 independent_target_roles=mfi,
                 target_frame_indices=parameter.get("h3_target_frame_indices") if mfi else None,
-                visual_condition_frame_indices=parameter.get("h3_visual_condition_frame_indices") if mfi else None,
+                visual_condition_frame_indices=parameter.get("h3_visual_condition_frame_indices") if mfi and getattr(args, "h3_reference_route", "native") not in {"qwen_image_only", "text_only"} else None,
                 condition_roles=condition_roles,
                 time_overrides=time_overrides,
             )

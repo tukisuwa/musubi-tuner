@@ -102,7 +102,7 @@ def test_grouped_image_and_video_selection(tmp_path, monkeypatch):
         route="dual",
         relative=False,
         seed=42,
-        samples_per_video=2,
+        samples_per_video=20,
         num_controls=2,
         max_frame_distance=3,
         max_targets=4,
@@ -116,6 +116,7 @@ def test_grouped_image_and_video_selection(tmp_path, monkeypatch):
     args.video_directory = str(tmp_path)
     records = read_records(args)
     assert records == read_records(args)
+    assert {len(r["targets"]) for r in records} == {1, 2, 3, 4}
     for record in records:
         controls = [e["index"] for e in record["controls"]]
         assert len(controls) == 2
@@ -226,3 +227,156 @@ def test_saved_mfi_latent_roundtrip_and_selected_decode(tmp_path, monkeypatch):
     assert (tmp_path / "out/001_index_-2.png").is_file()
     assert sequences[0][0].shape == (11, 32, 32, 3)
     assert sequences[0][1] == 24
+
+
+@pytest.mark.parametrize(
+    "route,qwen,dit",
+    [("dual", True, True), ("qwen_image_only", True, False), ("dit_latent_only", False, True), ("text_only", False, False)],
+)
+def test_training_and_generation_reference_routes(tmp_path, monkeypatch, route, qwen, dit):
+    import musubi_tuner.minimax_h3_train_network as train
+    import musubi_tuner.minimax_h3_generate_video as gen
+    from musubi_tuner.minimax_h3.media import H3Record, H3Reference
+
+    record = H3Record(
+        video_path=tmp_path / "target.png",
+        caption="test",
+        references=(H3Reference(type="image", path=tmp_path / "ref.png"),),
+        jsonl_line=1,
+    )
+    args = SimpleNamespace(
+        task="ref2va",
+        h3_reference_route=route,
+        h3_independent_target_roles=True,
+        h3_target_frame_indices="-3,7",
+        h3_visual_condition_frame_indices="0",
+        sample_prompts=str(tmp_path / "prompts.txt"),
+        video_vae="mock",
+        audio_vae="mock",
+        text_encoder="mock",
+    )
+    monkeypatch.setattr(train, "_require_sampling_path", lambda *a: None)
+    monkeypatch.setattr(train, "parse_inline_references", lambda *a: record.references)
+    monkeypatch.setattr(train, "load_prompts", lambda *a: [dict(prompt="test", ref=["ref.png"], enum=0, width=32, height=32)])
+    monkeypatch.setattr(train, "load_generation_record", lambda *a: record)
+    monkeypatch.setattr(train, "decode_generation_visuals", lambda *a: ({}, {}))
+    monkeypatch.setattr(train, "load_h3_processor", lambda *a: None)
+    monkeypatch.setattr(train, "load_h3_text_encoder", lambda *a, **k: torch.nn.Identity())
+    presentations = []
+
+    def presentation(rec, task, visuals):
+        presentations.append((task, bool(rec.references)))
+        return object()
+
+    monkeypatch.setattr(train, "build_presentation", presentation)
+    monkeypatch.setattr(train, "encode_h3_presentation", lambda *a: (torch.zeros(2, 4), torch.tensor([1, 0 if qwen else 1])))
+
+    class VAE(torch.nn.Module):
+        vae_ratio = 16
+
+    monkeypatch.setattr(train, "load_video_vae", lambda *a, **k: VAE())
+    monkeypatch.setattr(train, "load_audio_vae", lambda *a, **k: VAE())
+    geometry = H3VideoGeometry(1, 2, 2)
+    conditions = (torch.zeros(1, 24, 1, 2, 2),)
+    monkeypatch.setattr(train, "encode_visual_conditions", lambda *a: (conditions, (), {0: geometry}))
+    samples, _ = train.MiniMaxH3NetworkTrainer().prepare_sampling(args, SimpleNamespace(device=torch.device("cpu")), None)
+    assert presentations == [("ref2va" if qwen else "t2va", qwen)]
+    assert bool(samples[0]["h3_visual_conditions"]) == dit
+    assert samples[0]["h3_layout"].task == ("ref2va" if dit else "t2va")
+
+    gen_args = gen.setup_parser().parse_args(
+        [
+            "--output",
+            str(tmp_path),
+            "--task",
+            "ref2va",
+            "--h3_reference_route",
+            route,
+            "--h3_independent_target_roles",
+            "--h3_target_frame_indices=-3,7",
+            "--h3_visual_condition_frame_indices=0",
+            "--width",
+            "32",
+            "--height",
+            "32",
+        ]
+    )
+    gen_args.text_cache = None
+    monkeypatch.setattr(gen, "build_presentation", presentation)
+    monkeypatch.setattr(gen, "load_h3_processor", lambda *a: None)
+    monkeypatch.setattr(gen, "load_h3_text_encoder", lambda *a, **k: torch.nn.Identity())
+    monkeypatch.setattr(gen, "encode_h3_presentation", lambda *a: (torch.zeros(2, 4), torch.tensor([1, 0 if qwen else 1])))
+    gen._encode_text(gen_args, record, {}, torch.device("cpu"))
+    assert presentations[-1] == ("ref2va" if qwen else "t2va", qwen)
+
+    @contextmanager
+    def borrowed(*a):
+        yield VAE()
+
+    monkeypatch.setattr(gen, "_borrowed_video_vae", borrowed)
+    monkeypatch.setattr(gen, "encode_visual_conditions", lambda *a: (conditions, (), {0: geometry}))
+    visual, geoms, refs, audio = gen._encode_conditions(gen_args, record, {}, None, torch.device("cpu"))
+    assert bool(visual) == dit and not audio
+    layout = gen._build_layout(gen_args, 2, geoms, refs)
+    assert layout.task == ("ref2va" if dit else "t2va")
+
+
+@pytest.mark.parametrize("role", ["first", "last"])
+def test_mfi_training_sample_accepts_single_fl_control(role, monkeypatch):
+    import musubi_tuner.minimax_h3_train_network as train
+
+    monkeypatch.setattr(train, "_require_sampling_path", lambda *a: None)
+    args = SimpleNamespace(
+        task="fl2va", h3_independent_target_roles=True, h3_target_frame_indices="-3,7", h3_visual_condition_frame_indices="0"
+    )
+    sample = train._normalize_h3_sample_parameter(args, dict(prompt="test", **{f"{role}_frame": "image.png"}))
+    assert sample[f"{role}_frame"] == "image.png"
+
+
+def test_legacy_batch_mfi_decode_needs_no_audio_vae(tmp_path, monkeypatch):
+    import musubi_tuner.minimax_h3_generate_video as gen
+
+    args = gen.setup_parser().parse_args(
+        ["--output", str(tmp_path), "--latent_path", "mock.safetensors", "--output_type", "images"]
+    )
+    monkeypatch.setattr(
+        gen,
+        "_load_latent_file",
+        lambda *a: (
+            torch.zeros(1, 24, 2, 2, 2),
+            torch.zeros(1, 32, 2, 2),
+            124,
+            {"h3_independent_target_roles": "true", "h3_target_frame_indices": "-3,7"},
+        ),
+    )
+    outputs = []
+    monkeypatch.setattr(gen, "_decode_and_save", lambda args, video, audio, *rest: outputs.append(audio))
+    gen.process_latent_decode(args, torch.device("cpu"))
+    assert outputs == [None]
+
+
+def test_text_only_prompt_without_references(tmp_path):
+    import musubi_tuner.minimax_h3_generate_video as gen
+    from musubi_tuner.minimax_h3.generation_inputs import load_generation_record
+
+    args = gen.setup_parser().parse_args(
+        [
+            "--output",
+            str(tmp_path),
+            "--task",
+            "ref2va",
+            "--prompt",
+            "test",
+            "--h3_reference_route",
+            "text_only",
+            "--h3_independent_target_roles",
+            "--h3_target_frame_indices=-3,7",
+            "--output_type",
+            "latent",
+        ]
+    )
+    gen.validate_prompt_args(args)
+    assert load_generation_record(args).references == ()
+    args.task = "t2va"
+    with pytest.raises(ValueError, match="Ref2VA base"):
+        gen.validate_prompt_args(args)

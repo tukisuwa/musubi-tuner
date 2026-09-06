@@ -20,6 +20,8 @@ from tqdm.auto import tqdm
 
 from musubi_tuner.minimax_h3.audio_vae import load_audio_vae
 from musubi_tuner.minimax_h3.generation_inputs import (
+    route_task,
+    route_text_record,
     VIDEO_VAE_SPATIAL_RATIO,
     build_reference_geometries,
     decode_generation_visuals,
@@ -196,6 +198,7 @@ def validate_session_args(args: argparse.Namespace) -> None:
 
 def validate_prompt_args(args: argparse.Namespace, *, directory_output: bool = False) -> None:
     """Validate per-prompt arguments; with directory_output the output path is an auto-named directory."""
+    route_task(args, "dit")
     if args.width <= 0 or args.height <= 0 or args.width % 32 or args.height % 32:
         raise ValueError(f"MiniMax-H3 width and height must be positive and divisible by 32, got {args.width}x{args.height}")
     mfi = bool(getattr(args, "h3_independent_target_roles", False))
@@ -333,6 +336,11 @@ def validate_prompt_args(args: argparse.Namespace, *, directory_output: bool = F
             if getattr(args, label):
                 _require_path(getattr(args, label), label)
     else:
+        text_only = getattr(args, "h3_reference_route", "native") == "text_only"
+        if text_only and not args.ref and not args.reference_jsonl:
+            if not args.prompt or args.first_frame or args.last_frame:
+                raise ValueError("H3 text_only requires a prompt and no first/last frames")
+            return
         if bool(args.reference_jsonl) == bool(args.ref):
             raise ValueError("MiniMax-H3 Ref2VA requires exactly one of --reference_jsonl or --ref")
         if args.first_frame or args.last_frame:
@@ -490,7 +498,9 @@ def _encode_text(
     device: torch.device,
     shared: H3SharedModels | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    presentation = build_presentation(record, args.task, text_visuals)
+    record = route_text_record(args, record)
+    text_task = route_task(args, "text")
+    presentation = build_presentation(record, text_task, text_visuals)
     if args.text_cache:
         media_fingerprints = {
             reference.path: fingerprint_file(reference.path)
@@ -504,7 +514,7 @@ def _encode_text(
         )
         return load_cached_text_conditioning(
             args.text_cache,
-            task=args.task,
+            task=text_task,
             presentation_identity=presentation_identity,
         )
     cache_key = None
@@ -717,6 +727,8 @@ def _encode_conditions(
     device: torch.device,
     shared: H3SharedModels | None = None,
 ):
+    if route_task(args, "dit") == "t2va":
+        return (), (), (), ()
     visual_conditions = ()
     visual_geometries = ()
     reference_visual_geometries = {}
@@ -776,7 +788,7 @@ def _build_layout(args: argparse.Namespace, text_length: int, visual_geometries,
     if args.task == "fl2va":
         condition_roles = tuple(role for role, path in (("first", args.first_frame), ("last", args.last_frame)) if path)
     layout = build_h3_layout(
-        task=args.task,
+        task=route_task(args, "dit"),
         text_length=text_length,
         target_video=H3VideoGeometry(
             len(target_indices) if mfi else (ONE_FRAME_VIDEO_LATENT_FRAMES if one_frame else video_latent_frames(args.frame_count)),
@@ -793,7 +805,7 @@ def _build_layout(args: argparse.Namespace, text_length: int, visual_geometries,
         one_frame=one_frame,
         independent_target_roles=mfi,
         target_frame_indices=target_indices,
-        visual_condition_frame_indices=condition_indices,
+        visual_condition_frame_indices=None if getattr(args, "h3_reference_route", "native") in {"qwen_image_only", "text_only"} else condition_indices,
         condition_roles=condition_roles,
         time_overrides=_one_frame_time_overrides(args),
         output_fps=args.output_fps,
@@ -1131,6 +1143,7 @@ def _save_latent_file(
         metadata["h3_target_frame_indices"] = args.h3_target_frame_indices
         metadata["h3_visual_condition_frame_indices"] = args.h3_visual_condition_frame_indices or "default"
         metadata["h3_target_noise_coupling"] = args.h3_target_noise_coupling
+        metadata["h3_reference_route"] = getattr(args, "h3_reference_route", "native")
         plan = getattr(args, "_h3_mfi_plan", None)
         if plan:
             metadata["h3_mfi_plan"] = json.dumps(vars(plan))
@@ -1213,7 +1226,7 @@ def parse_prompt_line(line: str) -> dict:
             overrides["one_frame"] = value
         elif option == "o":
             overrides["output_name"] = value
-        elif option in {"h3_target_frame_indices", "h3_visual_condition_frame_indices", "h3_initial_latent", "h3_target_noise_coupling"}:
+        elif option in {"h3_target_frame_indices", "h3_visual_condition_frame_indices", "h3_initial_latent", "h3_target_noise_coupling", "h3_reference_route"}:
             overrides[option] = value
         elif option == "h3_strength":
             overrides[option] = float(value)
@@ -1406,7 +1419,7 @@ def process_from_file(args: argparse.Namespace, device: torch.device) -> None:
                 device=device,
                 shared=shared,
             )
-            if item.args.frame_count == 1:
+            if item.args.frame_count == 1 or getattr(item.args, "h3_independent_target_roles", False):
                 # the 2-frame audio target is a byproduct of the joint layout, not an output
                 item.audio_latents = None
             item.latent_file = _save_latent_file(
@@ -1528,7 +1541,10 @@ def process_latent_decode(args: argparse.Namespace, device: torch.device) -> Non
     loaded = []
     for path in args.latent_path:
         source = Path(path).expanduser()
-        loaded.append((source, *_load_latent_file(source)))
+        video, audio, frame_count, metadata = _load_latent_file(source)
+        if metadata.get("h3_independent_target_roles") == "true":
+            audio = None  # also accept older batch MFI files with placeholder audio
+        loaded.append((source, video, audio, frame_count, metadata))
     if any(audio_latents is not None for _, _, audio_latents, _, _ in loaded):
         _require_path(getattr(args, "audio_vae", None), "audio_vae")
     shared = H3SharedModels(device=device)
@@ -1559,6 +1575,7 @@ def process_latent_decode(args: argparse.Namespace, device: torch.device) -> Non
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--h3_reference_route", choices=("native", "dual", "qwen_image_only", "dit_latent_only", "text_only"), default="native")
     parser.add_argument(
         "--task",
         choices=("t2va", "fl2va", "ref2va"),

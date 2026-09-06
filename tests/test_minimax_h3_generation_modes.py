@@ -421,6 +421,21 @@ def test_from_file_batch_with_latent_output_type_keeps_latents_and_skips_decodin
     assert audio_latents is not None and frame_count == 5 and metadata["seeds"] == "11"
 
 
+def test_from_file_mfi_drops_audio_placeholder_before_saving(tmp_path, monkeypatch):
+    counters = {"text": 0, "transformer": 0, "video_vae": 0, "audio_vae": 0}
+    _stub_generation_models(monkeypatch, counters)
+    args = _batch_args(tmp_path, ["test --h3_independent_target_roles --h3_target_frame_indices -3,7"])
+    args.h3_visual_condition_frame_indices = None
+    args.h3_target_noise_coupling = "independent"
+    args.output_type = "latent"
+    generate.process_from_file(args, torch.device("cpu"))
+    kept = list((tmp_path / "outputs").glob("*_latent.safetensors"))
+    assert len(kept) == 1
+    _, audio, _, metadata = generate._load_latent_file(kept[0])
+    assert audio is None
+    assert metadata["h3_independent_target_roles"] == "true"
+
+
 def test_run_generation_latent_only_saves_a_decodable_file_without_vaes(tmp_path, monkeypatch):
     counters = {"text": 0, "transformer": 0, "video_vae": 0, "audio_vae": 0}
     _stub_generation_models(monkeypatch, counters)

@@ -31,6 +31,8 @@ def _load_training_module(monkeypatch):
     _stub(
         monkeypatch,
         "musubi_tuner.minimax_h3.generation_inputs",
+        route_task=noop,
+        route_text_record=noop,
         VIDEO_VAE_SPATIAL_RATIO=16,
         build_reference_geometries=noop,
         decode_generation_visuals=noop,
@@ -187,6 +189,8 @@ def _load_generation_module(monkeypatch):
     _stub(
         monkeypatch,
         "musubi_tuner.minimax_h3.generation_inputs",
+        route_task=noop,
+        route_text_record=noop,
         VIDEO_VAE_SPATIAL_RATIO=16,
         build_reference_geometries=noop,
         decode_generation_visuals=noop,

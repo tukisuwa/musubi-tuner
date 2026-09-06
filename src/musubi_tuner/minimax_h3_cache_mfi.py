@@ -58,7 +58,8 @@ def read_records(args):
                 candidates = [
                     i for i in range(count) if i not in controls and any(abs(i - c) <= args.max_frame_distance for c in controls)
                 ]
-                targets = args.target_indices or sorted(rng.sample(candidates, min(args.max_targets, len(candidates))))
+                target_count = rng.randint(1, min(args.max_targets, len(candidates))) if candidates else 0
+                targets = args.target_indices or sorted(rng.sample(candidates, target_count))
                 caption = path.with_suffix(".txt")
                 records.append(
                     dict(

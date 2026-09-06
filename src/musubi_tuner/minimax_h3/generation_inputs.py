@@ -29,6 +29,24 @@ VIDEO_VAE_SPATIAL_RATIO = 16
 ONE_FRAME_REFERENCE_FRAME_CAP = 15 * TARGET_FPS
 
 
+def route_task(args, modality: str) -> str:
+    route = getattr(args, "h3_reference_route", "native")
+    if route not in {"native", "dual", "qwen_image_only", "dit_latent_only", "text_only"}:
+        raise ValueError(f"Unsupported H3 reference route: {route}")
+    if route != "native" and args.task != "ref2va":
+        raise ValueError("--h3_reference_route requires the Ref2VA base (--task ref2va)")
+    omitted = {"dit_latent_only", "text_only"} if modality == "text" else {"qwen_image_only", "text_only"}
+    return "t2va" if route in omitted else args.task
+
+
+def route_text_record(args, record):
+    return (
+        replace(record, references=())
+        if getattr(args, "h3_reference_route", "native") in {"dit_latent_only", "text_only"}
+        else record
+    )
+
+
 def parse_one_frame_options(spec: str) -> tuple[int, tuple[int, ...] | None]:
     """Parses --one_frame "target_index=N,control_index=A;B" into 24 fps pixel-frame indices."""
 
@@ -89,6 +107,8 @@ def prepare_pixels(frames: torch.Tensor) -> torch.Tensor:
 
 
 def load_generation_record(args) -> H3Record:
+    if getattr(args, "h3_reference_route", "native") == "text_only" and not args.ref and not args.reference_jsonl:
+        return dummy_record(args.prompt or "")
     if args.task in {"t2va", "fl2va"}:
         return dummy_record(args.prompt or "")
 
@@ -110,7 +130,7 @@ def load_generation_record(args) -> H3Record:
 def decode_generation_visuals(args, record: H3Record, decoder: PyAVH3MediaDecoder):
     raw_visuals = {}
     text_visuals = {}
-    if args.task == "t2va":
+    if args.task == "t2va" or getattr(args, "h3_reference_route", "native") == "text_only":
         return raw_visuals, text_visuals
     if args.task == "fl2va":
         for role, path in (("first", args.first_frame), ("last", args.last_frame)):

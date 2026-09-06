@@ -94,7 +94,7 @@ Both stages must use the same source selection, dimensions, seed, relative-posit
 Instead of `--manifest`, use:
 
 - `--image_directory images --control_indices 2 --target_indices 0 4`: groups files by the prefix before their numeric suffix. Captions come from `<prefix>.txt`, falling back to `--caption`. Without explicit selection, the center image is the control and the remaining images are targets.
-- `--video_directory videos --num_controls 2 --max_targets 4 --max_frame_distance 32 --samples_per_video 3`: deterministically samples controls and nearby targets using `--seed`. Selection happens at caching time. Video captions come from the adjacent `.txt` file. Explicit `--control_indices` and `--target_indices` override random selection.
+- `--video_directory videos --num_controls 2 --max_targets 4 --max_frame_distance 32 --samples_per_video 3`: deterministically samples controls and nearby targets using `--seed`. Each draw samples the target count uniformly from 1 through the smaller of `max_targets` and the available candidate count, then samples that many indices. Selection happens at caching time. Video captions come from the adjacent `.txt` file. Explicit `--control_indices` and `--target_indices` override random selection. This count distribution changes selections relative to caches made before this behavior was added; rebuild both stages together in a new cache directory.
 - `--relative`: subtracts the smallest control index from both sets. Each manifest record can override this with `relative`.
 
 Use the resulting caches with a standard image dataset, for example:
@@ -148,6 +148,10 @@ The video and audio clocks both start at the selected base sigma, using their re
 | `native` | follows `--task` | follows `--task` |
 
 The route experiments still use the Ref2VA base family (`--task ref2va`). For `qwen_image_only` and `text_only`, the latent cache has a T2VA packed layout; for `dit_latent_only` and `text_only`, the Qwen cache must contain no vision rows.
+
+Generation accepts the same `--h3_reference_route` option (also per prompt in `--from_file`). Training-time samples automatically inherit the training route. Caption-only routes remove reference rows from the Qwen presentation; routes without DiT references omit those tokens entirely. `text_only` may use just `--prompt`, without reference inputs. Explicit control indices may still define relative target positioning, but are not inserted as DiT reference tokens on routes without DiT references. Existing text caches must match the routed presentation; incompatible caches are rejected.
+
+FL2VA MFI training samples accept first-only, last-only, or both controls, with one explicit visual-condition index per provided image. Batch MFI outputs omit placeholder audio, and decode-only also ignores placeholder audio in older MFI files.
 
 ## Compatibility and limits
 
