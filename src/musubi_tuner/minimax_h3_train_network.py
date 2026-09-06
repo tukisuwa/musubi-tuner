@@ -106,7 +106,18 @@ def _normalize_h3_sample_parameter(args: argparse.Namespace, parameter: dict[str
     height = int(sample.get("height", 1344))
     requested_frame_count = int(sample.get("frame_count", 124))
     one_frame_spec = sample.get("one_frame")
-    if requested_frame_count == 1:
+    mfi = bool(getattr(args, "h3_independent_target_roles", False))
+    if mfi:
+        indices = _parse_target_frame_indices(sample.get("h3_target_frame_indices", getattr(args, "h3_target_frame_indices", None)))
+        controls = _parse_visual_condition_frame_indices(sample.get("h3_visual_condition_frame_indices", getattr(args, "h3_visual_condition_frame_indices", None)))
+        if not indices:
+            raise ValueError("MFI training samples require explicit target indices in the prompt or CLI")
+        if one_frame_spec:
+            raise ValueError("MFI training samples do not combine with --of")
+        sample["h3_target_frame_indices"] = indices
+        sample["h3_visual_condition_frame_indices"] = controls
+        frame_count = len(indices)
+    elif requested_frame_count == 1:
         # experimental one-frame (image) sample: single-token target, no duration semantics
         if args.task not in {"t2va", "fl2va"}:
             raise ValueError("MiniMax-H3 one-frame training samples (--f 1) support --task t2va and fl2va only")
@@ -161,7 +172,7 @@ def _normalize_h3_sample_parameter(args: argparse.Namespace, parameter: dict[str
             raise ValueError("MiniMax-H3 FL2VA training sample requires a prompt")
         if reference_jsonl or ref_specs:
             raise ValueError("MiniMax-H3 FL2VA training sample does not accept reference_jsonl or --ref")
-        if frame_count == 1:
+        if frame_count == 1 and not mfi:
             # mirror the generation rules: any subset of first/last, one control_index per
             # provided frame (mandatory — the placement is the training signal)
             if not first_frame and not last_frame:
@@ -360,6 +371,15 @@ def _runtime_batch_plan(
     target_frame_indices: Sequence[int] | None = None,
     visual_condition_frame_indices: Sequence[int] | None = None,
 ) -> _H3RuntimeBatch:
+    from musubi_tuner.minimax_h3.mfi import cached_indices
+
+    if independent_target_roles:
+        target_frame_indices = cached_indices(batch, "mfi_target_indices", target_frame_indices)
+        visual_condition_frame_indices = cached_indices(batch, "mfi_control_indices", visual_condition_frame_indices)
+        if target_frame_indices is None:
+            raise ValueError("MFI training requires cached target indices or --h3_target_frame_indices")
+    elif "mfi_target_indices" in batch or "mfi_control_indices" in batch:
+        raise ValueError("MFI caches require --h3_independent_target_roles")
     if video_latents.ndim != 5 or video_latents.shape[1] != 24:
         raise ValueError(f"MiniMax-H3 target video latents must be [B,24,F,H,W], got {tuple(video_latents.shape)}")
     batch_size = video_latents.shape[0]
@@ -520,7 +540,7 @@ def _runtime_batch_plan(
     elif has_fl_condition:
         task = "fl2va"
         fl_condition_roles = _collect_fl_conditions(
-            batch, batch_size, visual_conditions, condition_geometries, allow_single_first=is_one_frame_batch
+            batch, batch_size, visual_conditions, condition_geometries, allow_single_first=is_one_frame_batch or independent_target_roles
         )
     elif reference_roles:
         task = "ref2va"
@@ -577,7 +597,7 @@ def _runtime_batch_plan(
         independent_target_roles=independent_target_roles,
         target_frame_indices=target_frame_indices,
         visual_condition_frame_indices=visual_condition_frame_indices,
-        condition_roles=fl_condition_roles if is_one_frame_batch and not independent_target_roles else None,
+        condition_roles=fl_condition_roles if is_one_frame_batch or independent_target_roles else None,
         time_overrides=time_overrides,
     )
     return _H3RuntimeBatch(
@@ -1072,7 +1092,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 if args.task == "ref2va"
                 else ()
             )
-            one_frame_sample = parameter["frame_count"] == 1
+            mfi = bool(getattr(args, "h3_independent_target_roles", False))
+            one_frame_sample = parameter["frame_count"] == 1 and not mfi
             condition_roles = None
             time_overrides = None
             if one_frame_sample:
@@ -1093,16 +1114,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 task=args.task,
                 text_length=parameter["h3_text_hidden_states"].shape[1],
                 target_video=H3VideoGeometry(
-                    ONE_FRAME_VIDEO_LATENT_FRAMES if one_frame_sample else video_latent_frames(parameter["frame_count"]),
+                    len(parameter["h3_target_frame_indices"]) if mfi else (ONE_FRAME_VIDEO_LATENT_FRAMES if one_frame_sample else video_latent_frames(parameter["frame_count"])),
                     parameter["height"] // VIDEO_VAE_SPATIAL_RATIO,
                     parameter["width"] // VIDEO_VAE_SPATIAL_RATIO,
                 ),
                 target_audio_frames=(
-                    ONE_FRAME_AUDIO_LATENT_FRAMES if one_frame_sample else audio_latent_frames(parameter["frame_count"])
+                    ONE_FRAME_AUDIO_LATENT_FRAMES if mfi or one_frame_sample else audio_latent_frames(parameter["frame_count"])
                 ),
                 visual_conditions=parameter["_h3_visual_geometries"],
                 references=references,
                 one_frame=one_frame_sample,
+                independent_target_roles=mfi,
+                target_frame_indices=parameter.get("h3_target_frame_indices") if mfi else None,
+                visual_condition_frame_indices=parameter.get("h3_visual_condition_frame_indices") if mfi else None,
                 condition_roles=condition_roles,
                 time_overrides=time_overrides,
             )
@@ -1186,6 +1210,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 device=device,
                 video_dtype=torch.float32,
                 audio_dtype=torch.float32,
+                video_noise_coupling=getattr(args, "h3_target_noise_coupling", "independent"),
             )
             visual_conditions, audio_conditions = augment_condition_latents(
                 sample_parameter["h3_visual_conditions"],
@@ -1229,7 +1254,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             logger.info("Decoding MiniMax-H3 training sample video")
             video_vae.to(device).eval()
             _, video_dtype = module_device_dtype(video_vae, VIDEO_VAE_DECODE_DTYPE)
-            decoded_video = video_vae.decode(video_latents.to(device=device, dtype=video_dtype)).cpu()
+            mfi = bool(getattr(args, "h3_independent_target_roles", False))
+            if mfi:
+                decoded_video = torch.cat([
+                    video_vae.decode(video_latents[:, :, slot:slot+1].to(device=device, dtype=video_dtype)).cpu()[:, :, :1]
+                    for slot in range(video_latents.shape[2])
+                ], dim=2)
+            else:
+                decoded_video = video_vae.decode(video_latents.to(device=device, dtype=video_dtype)).cpu()
             video_vae.to("cpu")
             del video_latents
             clean_memory_on_device(device)
@@ -1242,7 +1274,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             prefix = "" if args.output_name is None else f"{args.output_name}_"
             output_stem = f"{prefix}{number}_{prompt_index:02d}_{timestamp}{seed_suffix}"
 
-            if frame_count == 1:
+            if mfi:
+                del audio_latents
+                output_path = Path(save_dir) / output_stem
+                output_path.mkdir(parents=True, exist_ok=True)
+                pixels = decoded_video_to_uint8(decoded_video, frame_limit=len(layout.target_frame_indices))
+                for slot, index in enumerate(layout.target_frame_indices):
+                    write_image(pixels[slot], output_path / f"{slot:03d}_index_{index:+d}.png")
+            elif frame_count == 1:
                 # one-frame sample: the audio rows are a byproduct and are never decoded
                 del audio_latents
                 output_path = Path(save_dir) / f"{output_stem}.png"
@@ -1266,7 +1305,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 wandb_tracker = accelerator.get_tracker("wandb")
             except (AttributeError, ValueError):
                 wandb_tracker = None
-            if wandb_tracker is not None:
+            if wandb_tracker is not None and not mfi:
                 try:
                     import wandb
                 except ImportError:
@@ -1569,7 +1608,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             target_audio_frames=runtime.layout.target_audio_frames,
             visual_conditions=runtime.layout.visual_conditions,
             references=runtime.layout.references,
-            one_frame=runtime.layout.target_video.frames == ONE_FRAME_VIDEO_LATENT_FRAMES,
+            one_frame=runtime.layout.target_video.frames == ONE_FRAME_VIDEO_LATENT_FRAMES and not getattr(args, "h3_independent_target_roles", False),
+            independent_target_roles=bool(getattr(args, "h3_independent_target_roles", False)),
+            target_frame_indices=runtime.layout.target_frame_indices,
+            visual_condition_frame_indices=runtime.layout.visual_condition_frame_indices,
             condition_roles=uncond_condition_roles or None,
             time_overrides=runtime.layout.time_overrides,
         )

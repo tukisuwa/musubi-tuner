@@ -574,6 +574,13 @@ def save_latent_cache_minimax_h3(
         if key == AUDIO_PRESENT_KEY:
             normalized[key] = tensor.detach().cpu().contiguous()
             continue
+        if key in {"mfi_target_indices_int64", "mfi_control_indices_int64"}:
+            if tensor.ndim != 1 or tensor.dtype != torch.int64:
+                raise ValueError(f"MiniMax-H3 {key} must be an int64 [N] tensor")
+            if key == "mfi_target_indices_int64" and tensor.numel() == 0:
+                raise ValueError("MiniMax-H3 MFI target indices must not be empty")
+            normalized[key] = tensor.detach().cpu().contiguous()
+            continue
         if key == ONE_FRAME_TARGET_INDEX_KEY:
             if tensor.shape != torch.Size([]) or tensor.dtype != torch.int64 or tensor.item() < 0:
                 raise ValueError(f"MiniMax-H3 {ONE_FRAME_TARGET_INDEX_KEY} must be a nonnegative scalar int64 tensor")

@@ -19,6 +19,10 @@ def line_to_prompt_dict(line: str) -> dict:
 
     for parg in prompt_args:
         try:
+            m = re.fullmatch(r"(h3_target_frame_indices|h3_visual_condition_frame_indices)\s+(.+)", parg)
+            if m:
+                prompt_dict[m.group(1)] = m.group(2).strip()
+                continue
             m = re.match(r"w (\d+)", parg, re.IGNORECASE)
             if m:
                 prompt_dict["width"] = int(m.group(1))

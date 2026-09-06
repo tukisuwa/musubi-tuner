@@ -175,7 +175,16 @@ def sample_joint_av(
     audio_condition_clean: float = 1.0,
     step_callback: Callable[[int, int], None] | None = None,
     x0_callback: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
+    initial_video_source: torch.Tensor | None = None,
+    strength: float = 1.0,
 ) -> H3SampleResult:
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("MiniMax-H3 sampling strength must be in [0,1]")
+    if strength != 1.0 and initial_video_source is None:
+        raise ValueError("MiniMax-H3 strength requires an initial video source")
+    if initial_video_source is not None:
+        if initial_video_source.shape != initial_video.shape or not torch.isfinite(initial_video_source).all():
+            raise ValueError("MiniMax-H3 initial source must match the target shape and be finite")
     if initial_video.ndim != 5 or tuple(initial_video.shape[2:]) != (
         layout.target_video.frames,
         layout.target_video.height,
@@ -199,8 +208,17 @@ def sample_joint_av(
         audio_shift=audio_shift,
         device=initial_video.device,
     )
-    video = initial_video
-    audio = initial_audio
+    if initial_video_source is not None:
+        # Both modality clocks start at the same truncated base sigma. The audio
+        # placeholder has a zero source; image MFI never emits it as audio.
+        base = schedule.base * strength
+        schedule = H3SigmaSchedule(base, _shift(base, video_shift), _shift(base, audio_shift))
+        sigma = schedule.video[0].to(initial_video)
+        video = (1 - sigma) * initial_video_source.to(initial_video) + sigma * initial_video
+        audio = schedule.audio[0].to(initial_audio) * initial_audio
+    else:
+        video = initial_video
+        audio = initial_audio
     for index in range(steps):
         sigma_video = schedule.video[index].to(dtype=torch.float32)
         sigma_audio = schedule.audio[index].to(dtype=torch.float32)

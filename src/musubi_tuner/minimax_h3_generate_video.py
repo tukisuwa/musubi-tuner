@@ -4,6 +4,7 @@ import argparse
 import copy
 import gc
 import itertools
+import json
 import logging
 import random
 from collections import OrderedDict
@@ -36,6 +37,7 @@ from musubi_tuner.minimax_h3.media import (
 from musubi_tuner.minimax_h3.checkpoint import resolve_safetensors_files
 from musubi_tuner.modules.convrot_int8_utils import has_comfy_quant_tensors
 from musubi_tuner.minimax_h3.model import MiniMaxH3Config, load_h3_transformer
+from musubi_tuner.minimax_h3.mfi import plan_indices, mask_condition
 from musubi_tuner.minimax_h3.packing import (
     FRAME_RESCALE,
     ONE_FRAME_AUDIO_LATENT_FRAMES,
@@ -210,8 +212,29 @@ def validate_prompt_args(args: argparse.Namespace, *, directory_output: bool = F
             raise ValueError("MiniMax-H3 indexed MFI does not combine with one-frame options or temporal stretch")
         if args.trajectory_dir:
             raise ValueError("MiniMax-H3 indexed MFI does not support trajectory decoding")
+        plan_indices(target_indices, condition_indices or (),
+                     relative=getattr(args, "h3_relative_positioning", False),
+                     interpolate=getattr(args, "h3_interpolate", False),
+                     thresholds=tuple(getattr(args, "h3_interpolation_thresholds", (2, 3))),
+                     save_interpolated=getattr(args, "h3_save_interpolated", False))
+        strength = getattr(args, "h3_strength", 1.0)
+        initial_images = getattr(args, "h3_initial_image", None)
+        initial_path = getattr(args, "h3_initial_latent", None)
+        if initial_images and initial_path:
+            raise ValueError("Use only one of --h3_initial_image and --h3_initial_latent")
+        if not 0 <= strength <= 1 or (strength != 1 and not (initial_path or initial_images)):
+            raise ValueError("MFI strength must be in [0,1] and requires an initial image/latent below 1")
+        if getattr(args, "h3_initial_latent", None):
+            _require_path(args.h3_initial_latent, "h3_initial_latent")
+        for path in (initial_images or []) + (getattr(args, "h3_control_mask", None) or []):
+            _require_path(path, "MFI image/mask")
     elif target_indices is not None or condition_indices is not None:
         raise ValueError("MiniMax-H3 explicit MFI indices require --h3_independent_target_roles")
+    elif any(getattr(args, key, None) for key in (
+        "h3_relative_positioning", "h3_interpolate", "h3_save_interpolated", "h3_control_mask",
+        "h3_initial_latent", "h3_initial_image", "h3_sequence_video",
+    )) or getattr(args, "h3_strength", 1.0) != 1.0:
+        raise ValueError("MiniMax-H3 MFI controls require --h3_independent_target_roles")
     one_frame = args.frame_count == 1 and not mfi
     # fps above the native rate would let the duration gate admit packed sequences far past
     # the released maximum (and desynchronize the floored audio count), so the squeeze
@@ -739,6 +762,15 @@ def _build_layout(args: argparse.Namespace, text_length: int, visual_geometries,
     condition_indices = _parse_mfi_indices(
         getattr(args, "h3_visual_condition_frame_indices", None), "h3_visual_condition_frame_indices"
     )
+    if mfi:
+        plan = plan_indices(target_indices, condition_indices or (),
+                            relative=getattr(args, "h3_relative_positioning", False),
+                            interpolate=getattr(args, "h3_interpolate", False),
+                            thresholds=tuple(getattr(args, "h3_interpolation_thresholds", (2, 3))),
+                            save_interpolated=getattr(args, "h3_save_interpolated", False))
+        args._h3_mfi_plan = plan
+        target_indices = plan.targets
+        condition_indices = plan.controls if condition_indices is not None else None
     one_frame = args.frame_count == 1 and not mfi
     condition_roles = None
     if args.task == "fl2va":
@@ -845,6 +877,38 @@ def _sample_latents(
         audio_dtype=torch.float32,
         video_noise_coupling=getattr(args, "h3_target_noise_coupling", "independent"),
     )
+    masks = getattr(args, "h3_control_mask", None) or []
+    if masks:
+        from PIL import Image
+        import numpy as np
+
+        if len(masks) != len(visual_conditions):
+            raise ValueError("MFI requires one --h3_control_mask per visual condition")
+        visual_conditions = tuple(
+            mask_condition(latent, np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255)
+            for latent, path in zip(visual_conditions, masks)
+        )
+    initial_source = None
+    if getattr(args, "h3_initial_latent", None):
+        source = load_file(args.h3_initial_latent, device="cpu")
+        if "latent_video" not in source:
+            raise ValueError("MFI initial latent file requires latent_video")
+        initial_source = source["latent_video"].to(initial_video)
+    initial_images = getattr(args, "h3_initial_image", None)
+    if initial_images:
+        from musubi_tuner.minimax_h3_cache_mfi import read_frame
+        from musubi_tuner.minimax_h3_cache_latents import _prepare_pixels, _encode_condition_video
+        if len(initial_images) not in (1, layout.target_video.frames):
+            raise ValueError("MFI requires one initial image to broadcast or one per expanded target")
+        with _borrowed_video_vae(args, device, VIDEO_VAE_ENCODE_DTYPE, shared) as vae:
+            initial_source = torch.cat([
+                _encode_condition_video(vae, _prepare_pixels(read_frame({"path": path}, (args.width, args.height), {})[None]))
+                for path in initial_images
+            ], dim=2).to(initial_video)
+        if len(initial_images) == 1:
+            initial_source = initial_source.expand_as(initial_video)
+    if initial_source is not None and (initial_source.shape != initial_video.shape or not torch.isfinite(initial_source).all()):
+        raise ValueError("MFI initial source must match the expanded target shape and contain finite values")
     visual_conditions, audio_conditions = augment_condition_latents(
         visual_conditions,
         audio_conditions,
@@ -873,6 +937,7 @@ def _sample_latents(
             audio_condition_clean=args.h3_audio_cond_clean,
             step_callback=lambda completed, total: progress.update(1),
             x0_callback=x0_callback,
+            **({"initial_video_source": initial_source, "strength": args.h3_strength} if initial_source is not None else {}),
         )
     video_latents = sample.video.detach().cpu()
     audio_latents = sample.audio.detach().cpu()
@@ -905,16 +970,28 @@ def _decode_and_save(
             output_path = Path(output_path)
             output_path.mkdir(parents=True, exist_ok=True)
             target_indices = _parse_mfi_indices(args.h3_target_frame_indices, "h3_target_frame_indices")
+            plan = getattr(args, "_h3_mfi_plan", None)
+            slots = plan.output_slots if plan else tuple(range(len(target_indices)))
+            indices = plan.output_indices if plan else target_indices
+            frames = []
             with torch.no_grad():
-                for slot, frame_index in enumerate(target_indices):
+                for output_slot, (slot, frame_index) in enumerate(zip(slots, indices)):
                     decoded = video_vae.decode(
                         video_latents[:, :, slot : slot + 1].to(device=device, dtype=VIDEO_VAE_DECODE_DTYPE)
                     ).cpu()
-                    write_image(
-                        decoded_video_to_uint8(decoded, frame_limit=1)[0],
-                        output_path / f"{slot:03d}_index_{frame_index:+d}.png",
-                    )
+                    frame = decoded_video_to_uint8(decoded, frame_limit=1)[0]
+                    write_image(frame, output_path / f"{output_slot:03d}_index_{frame_index:+d}.png")
+                    if getattr(args, "h3_sequence_video", False):
+                        frames.append((frame_index, frame))
                     del decoded
+            if frames:
+                # Sparse indices retain their 24 fps spacing using holds, not invented motion.
+                ordered = sorted(frames, key=lambda pair: pair[0])
+                timeline = []
+                for i, (index, frame) in enumerate(ordered):
+                    count = ordered[i + 1][0] - index if i + 1 < len(ordered) else 1
+                    timeline.extend([frame] * count)
+                write_video_only(torch.stack(timeline), output_path / "sequence.mp4", fps=TARGET_FPS)
             logger.info("Saved MiniMax-H3 indexed MFI outputs: %s", output_path)
             return output_path
         with torch.no_grad():
@@ -1054,6 +1131,13 @@ def _save_latent_file(
         metadata["h3_target_frame_indices"] = args.h3_target_frame_indices
         metadata["h3_visual_condition_frame_indices"] = args.h3_visual_condition_frame_indices or "default"
         metadata["h3_target_noise_coupling"] = args.h3_target_noise_coupling
+        plan = getattr(args, "_h3_mfi_plan", None)
+        if plan:
+            metadata["h3_mfi_plan"] = json.dumps(vars(plan))
+        metadata["h3_strength"] = str(getattr(args, "h3_strength", 1.0))
+        metadata["h3_initial_latent"] = getattr(args, "h3_initial_latent", None) or "noise"
+        metadata["h3_initial_images"] = json.dumps(getattr(args, "h3_initial_image", None) or [])
+        metadata["h3_control_masks"] = json.dumps(getattr(args, "h3_control_mask", None) or [])
     path.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(path), metadata=metadata)
     logger.info("Saved MiniMax-H3 latents: %s", path)
@@ -1074,7 +1158,7 @@ def _load_latent_file(path: Path) -> tuple[torch.Tensor, torch.Tensor | None, in
     if frame_count is None:
         raise ValueError(f"MiniMax-H3 latent file {path} is missing its frame_count metadata")
     frame_count = int(frame_count)
-    if frame_count > 1 and audio_latents is None:
+    if frame_count > 1 and audio_latents is None and metadata.get("h3_independent_target_roles") != "true":
         raise ValueError(f"MiniMax-H3 latent file {path} is missing latent_audio for a {frame_count}-frame video")
     return video_latents, audio_latents, frame_count, metadata
 
@@ -1129,6 +1213,20 @@ def parse_prompt_line(line: str) -> dict:
             overrides["one_frame"] = value
         elif option == "o":
             overrides["output_name"] = value
+        elif option in {"h3_target_frame_indices", "h3_visual_condition_frame_indices", "h3_initial_latent", "h3_target_noise_coupling"}:
+            overrides[option] = value
+        elif option == "h3_strength":
+            overrides[option] = float(value)
+        elif option in {"h3_initial_image", "h3_control_mask"}:
+            overrides.setdefault(option, []).append(value)
+        elif option == "h3_interpolation_thresholds":
+            overrides[option] = tuple(int(v) for v in value.replace(",", " ").split())
+            if len(overrides[option]) != 2:
+                raise ValueError("--h3_interpolation_thresholds expects PAST FUTURE")
+        elif option in {"h3_independent_target_roles", "h3_relative_positioning", "h3_interpolate", "h3_save_interpolated", "h3_sequence_video"}:
+            if value not in {"", "true", "false"}:
+                raise ValueError(f"--{option} expects true or false")
+            overrides[option] = value != "false"
         else:
             raise ValueError(f"MiniMax-H3 prompt line has unknown option --{option}")
     if refs:
@@ -1439,9 +1537,17 @@ def process_latent_decode(args: argparse.Namespace, device: torch.device) -> Non
         try:
             item_args = copy.deepcopy(args)
             item_args.frame_count = frame_count
+            item_args.h3_independent_target_roles = metadata.get("h3_independent_target_roles") == "true"
+            item_args._h3_mfi_plan = None
+            if metadata.get("h3_independent_target_roles") == "true":
+                from musubi_tuner.minimax_h3.mfi import MFIPlan
+                item_args.h3_independent_target_roles = True
+                item_args.h3_target_frame_indices = metadata["h3_target_frame_indices"]
+                if "h3_mfi_plan" in metadata:
+                    item_args._h3_mfi_plan = MFIPlan(**json.loads(metadata["h3_mfi_plan"]))
             item_args.output_fps = _parse_output_fps_metadata(source, metadata, args.output_fps)
             seed = metadata.get("seeds", "0")
-            if args.output_type == "images":
+            if args.output_type == "images" or getattr(item_args, "h3_independent_target_roles", False):
                 output_path = output_dir / f"{_time_flag()}_{seed}_{source.stem}"
             else:
                 suffix = ".png" if frame_count == 1 else ".mp4"
@@ -1552,6 +1658,15 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="indexed MFI mode: generate independent semantic target slices and decode each slice as a PNG",
     )
+    parser.add_argument("--h3_relative_positioning", action="store_true")
+    parser.add_argument("--h3_interpolate", action="store_true")
+    parser.add_argument("--h3_interpolation_thresholds", type=int, nargs=2, default=(2, 3), metavar=("PAST", "FUTURE"))
+    parser.add_argument("--h3_save_interpolated", action="store_true")
+    parser.add_argument("--h3_control_mask", action="append", help="grayscale mask per visual condition; white keeps, black zeros")
+    parser.add_argument("--h3_initial_latent", help="safetensors with latent_video matching the expanded MFI target shape")
+    parser.add_argument("--h3_initial_image", action="append", help="initial source image; one broadcast image or one per expanded target")
+    parser.add_argument("--h3_strength", type=float, default=1.0, help="initial source denoising strength, 0 keeps source, 1 starts from noise")
+    parser.add_argument("--h3_sequence_video", action="store_true", help="also save sorted target images as 24 fps video, holding across index gaps")
     parser.add_argument(
         "--h3_target_frame_indices",
         default=None,
