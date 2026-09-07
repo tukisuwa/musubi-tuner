@@ -543,14 +543,31 @@ class ModelOffloader(Offloader):
         if self.debug:
             print(f"[{self.block_type}] Prepare block devices before forward")
 
+        # A previous forward may still have asynchronous swaps in flight. Drain
+        # them before changing the parameter placement they are updating.
+        for block_idx in list(self.futures):
+            self._wait_blocks_move(block_idx)
+        _synchronize_device(self.device)
+        cpu_device = torch.device("cpu")
+        swapped = blocks[self.num_blocks - self.blocks_to_swap :]
+        # Evict ALL trailing weights first: on re-entry the tail may occupy the
+        # slots needed by the leading blocks. Loading the head first can OOM.
+        for b in swapped:
+            weighs_to_device(b, cpu_device)
+        for b in swapped:
+            # Move non-swapped parameters/buffers without a temporary GPU copy
+            # of the large CPU Linear weights (also important on first prepare).
+            weights = [(m, m.weight) for m, _ in default_swap_tensor_selector(b)]
+            try:
+                for module, _ in weights:
+                    module.weight = None
+                b.to(self.device)
+            finally:
+                for module, weight in weights:
+                    module.weight = weight
         for b in blocks[0 : self.num_blocks - self.blocks_to_swap]:
             b.to(self.device)
-            weighs_to_device(b, self.device)  # make sure weights are on device
-
-        cpu_device = torch.device("cpu")
-        for b in blocks[self.num_blocks - self.blocks_to_swap :]:
-            b.to(self.device)  # move block to device first. this makes sure that buffers (non weights) are on the device
-            weighs_to_device(b, cpu_device)  # make sure weights are on cpu
+            weighs_to_device(b, self.device)
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)

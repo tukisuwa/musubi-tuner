@@ -412,6 +412,12 @@ class H3SharedModels:
     lora_networks: list[torch.nn.Module] = field(default_factory=list)
     text_conditioning_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=OrderedDict)
 
+    def release_vaes(self) -> None:
+        self.video_vaes.clear()
+        self.audio_vae = None
+        gc.collect()
+        clean_memory_on_device(self.device)
+
     def release_text_encoder(self) -> None:
         if self.processor is None and self.text_encoder is None:
             return
@@ -860,6 +866,28 @@ def _setup_trajectory(args: argparse.Namespace):
     return trajectory_dir, trajectory_schedule, trajectory, x0_callback
 
 
+def _encode_initial_images(
+    args: argparse.Namespace, device: torch.device, shared: H3SharedModels | None = None
+) -> torch.Tensor:
+    from musubi_tuner.minimax_h3_cache_mfi import read_frame
+    from musubi_tuner.minimax_h3_cache_latents import _prepare_pixels, _encode_condition_video
+
+    # Keep the borrowed model in a separate scope: the caller's `with ... as`
+    # binding otherwise retains its GPU weights through transformer loading.
+    with _borrowed_video_vae(args, device, VIDEO_VAE_ENCODE_DTYPE, shared) as vae:
+        source = torch.cat(
+            [
+                _encode_condition_video(vae, _prepare_pixels(read_frame({"path": path}, (args.width, args.height), {})[None]))
+                for path in args.h3_initial_image
+            ],
+            dim=2,
+        ).cpu()
+    del vae
+    gc.collect()
+    clean_memory_on_device(device)
+    return source
+
+
 def _sample_latents(
     args: argparse.Namespace,
     *,
@@ -872,6 +900,7 @@ def _sample_latents(
     device: torch.device,
     shared: H3SharedModels | None = None,
     x0_callback=None,
+    initial_image_latents: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     generator = create_sampling_generator(seed)
     initial_video, initial_audio = initialize_target_latents(
@@ -908,15 +937,11 @@ def _sample_latents(
         initial_source = source["latent_video"].to(initial_video)
     initial_images = getattr(args, "h3_initial_image", None)
     if initial_images:
-        from musubi_tuner.minimax_h3_cache_mfi import read_frame
-        from musubi_tuner.minimax_h3_cache_latents import _prepare_pixels, _encode_condition_video
         if len(initial_images) not in (1, layout.target_video.frames):
             raise ValueError("MFI requires one initial image to broadcast or one per expanded target")
-        with _borrowed_video_vae(args, device, VIDEO_VAE_ENCODE_DTYPE, shared) as vae:
-            initial_source = torch.cat([
-                _encode_condition_video(vae, _prepare_pixels(read_frame({"path": path}, (args.width, args.height), {})[None]))
-                for path in initial_images
-            ], dim=2).to(initial_video)
+        if initial_image_latents is None:
+            initial_image_latents = _encode_initial_images(args, device, shared)
+        initial_source = initial_image_latents.to(initial_video)
         if len(initial_images) == 1:
             initial_source = initial_source.expand_as(initial_video)
     if initial_source is not None and (initial_source.shape != initial_video.shape or not torch.isfinite(initial_source).all()):
@@ -1331,6 +1356,7 @@ class _BatchItem:
     visual_geometries: tuple = ()
     reference_geometries: tuple = ()
     audio_conditions: tuple = ()
+    initial_image_latents: torch.Tensor | None = None
     video_latents: torch.Tensor | None = None
     audio_latents: torch.Tensor | None = None
     latent_file: Path | None = None
@@ -1343,8 +1369,9 @@ def _mark_failed(item: _BatchItem, stage: str, error: Exception) -> None:
 
 
 def process_from_file(args: argparse.Namespace, device: torch.device) -> None:
-    """Phased batch: each model family is loaded once and serves every prompt, so the
-    peak VRAM matches single-shot generation. Sampled latents are written to disk
+    """Phased batch: each stage shares its models across prompts; encoding VAEs
+    are released before Qwen/DiT, and decoding VAEs load after DiT is released.
+    Sampled latents are written to disk
     immediately; a crash before decoding loses nothing (--latent_path decodes them)."""
     with open(args.from_file, "r", encoding="utf-8") as handle:
         lines = handle.readlines()
@@ -1387,8 +1414,13 @@ def process_from_file(args: argparse.Namespace, device: torch.device) -> None:
                 item.audio_conditions,
             ) = _encode_conditions(item.args, item.record, raw_visuals, decoder, device, shared)
             del raw_visuals
+            if getattr(item.args, "h3_initial_image", None):
+                item.initial_image_latents = _encode_initial_images(item.args, device, shared)
         except Exception as error:
             _mark_failed(item, "input preparation", error)
+    # The FP32 encoder VAE is ~10 GiB even on CPU. Do not carry it into
+    # Qwen preparation or DiT loading; decoding loads only its required dtype.
+    shared.release_vaes()
     clean_memory_on_device(device)
 
     logger.info("MiniMax-H3 batch phase 2/4: text encoding")
@@ -1418,6 +1450,11 @@ def process_from_file(args: argparse.Namespace, device: torch.device) -> None:
                 audio_conditions=item.audio_conditions,
                 device=device,
                 shared=shared,
+                **(
+                    {"initial_image_latents": item.initial_image_latents}
+                    if item.initial_image_latents is not None
+                    else {}
+                ),
             )
             if item.args.frame_count == 1 or getattr(item.args, "h3_independent_target_roles", False):
                 # the 2-frame audio target is a byproduct of the joint layout, not an output
@@ -1433,6 +1470,7 @@ def process_from_file(args: argparse.Namespace, device: torch.device) -> None:
             item.text_token_tags = None
             item.visual_conditions = ()
             item.audio_conditions = ()
+            item.initial_image_latents = None
         except Exception as error:
             _mark_failed(item, "sampling", error)
     shared.release_transformer()

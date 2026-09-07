@@ -436,6 +436,44 @@ def test_from_file_mfi_drops_audio_placeholder_before_saving(tmp_path, monkeypat
     assert metadata["h3_independent_target_roles"] == "true"
 
 
+def test_batch_preencodes_initial_images_and_releases_vaes_before_text(tmp_path, monkeypatch):
+    import weakref
+
+    counters = {"text": 0, "transformer": 0, "video_vae": 0, "audio_vae": 0}
+    _stub_generation_models(monkeypatch, counters)
+    initial = tmp_path / "initial.png"
+    initial.touch()
+    args = _batch_args(
+        tmp_path,
+        [f"test --h3_independent_target_roles --h3_target_frame_indices -3,7 --h3_initial_image {initial} --h3_strength 0"],
+    )
+    args.h3_visual_condition_frame_indices = None
+    args.h3_target_noise_coupling = "independent"
+    args.output_type = "latent"
+    refs = []
+
+    def encode_initial(args, device, shared):
+        assert not refs, "initial VAE must not be reloaded during sampling"
+        shared.video_vaes[torch.float32] = torch.nn.Linear(1, 1)
+        refs.append(weakref.ref(shared.video_vaes[torch.float32]))
+        return torch.ones(1, 24, 1, args.height // 16, args.width // 16)
+
+    original_text = generate._encode_text
+
+    def encode_text(args, record, visuals, device, shared):
+        assert not shared.video_vaes and shared.audio_vae is None
+        assert refs[0]() is None
+        return original_text(args, record, visuals, device, shared)
+
+    monkeypatch.setattr(generate, "_encode_initial_images", encode_initial)
+    monkeypatch.setattr(generate, "_encode_text", encode_text)
+    generate.process_from_file(args, torch.device("cpu"))
+    kept = list((tmp_path / "outputs").glob("*_latent.safetensors"))
+    assert len(kept) == 1
+    video, audio, _, _ = generate._load_latent_file(kept[0])
+    assert audio is None and torch.equal(video, torch.ones_like(video))
+
+
 def test_run_generation_latent_only_saves_a_decodable_file_without_vaes(tmp_path, monkeypatch):
     counters = {"text": 0, "transformer": 0, "video_vae": 0, "audio_vae": 0}
     _stub_generation_models(monkeypatch, counters)
