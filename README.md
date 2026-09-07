@@ -174,7 +174,7 @@ For detailed information on specific architectures, configurations, and advanced
 - [Kandinsky 5](./docs/kandinsky5.md)
 - [FLUX.2](./docs/flux_2.md)
 - [MiniMax-H3](./docs/minimax_h3.md)
-- [MiniMax-H3 indexed MFI (experimental)](./docs/minimax_h3_mfi.md)
+- [MiniMax-H3 indexed MFI (experimental)](./docs/minimax_h3_mfi.md) / [日本語](./docs/minimax_h3_mfi_ja.md)
 
 **Common Configuration & Usage:**
 - [Dataset Configuration](./docs/dataset_config.md)

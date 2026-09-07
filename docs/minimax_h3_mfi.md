@@ -1,16 +1,18 @@
 # MiniMax-H3 indexed multi-frame inference (MFI)
 
+[日本語版](minimax_h3_mfi_ja.md)
+
 This branch adds an experimental, opt-in H3 layout for generating several independent image roles in one DiT call.
 
 MFI uses one shared coordinate contract:
 
 ```text
-clean visual conditions: {(latent, signed pixel-frame index)}
+visual conditions:       {(latent, signed pixel-frame index)}
 noisy target roles:      {(latent, signed pixel-frame index)}
 model output:             target rows only
 ```
 
-The indices are MM-RoPE coordinates, not built-in semantic labels. MFI does not prescribe a role set, role count, tensor order, or index assignment. Those meanings are learned from the paired targets and are defined by the training contract together with the stable tensor order, indices, reference route, and noise policy.
+The indices are MM-RoPE coordinates, not built-in semantic labels. MFI does not prescribe a role set, role count, tensor order, or index assignment. Those meanings are learned from the paired targets and are defined by the training contract together with the stable tensor order, indices, reference route, and noise policy. Visual conditions can receive condition-noise augmentation controlled by `--h3_visual_cond_clean`; they are not necessarily completely clean at the model input.
 
 ## Generation
 
@@ -52,6 +54,7 @@ Example training flags for two joint roles are:
 accelerate launch -m musubi_tuner.minimax_h3_train_network \
   --task ref2va --dataset_config /path/to/dataset.toml \
   --dit /path/to/ref2va_dit.safetensors \
+  --output_dir outputs/mfi_training --output_name multi_role_lora \
   --video_only --mixed_precision bf16 \
   --network_module networks.lora_minimax_h3 --network_dim 8 --network_alpha 8 \
   --h3_independent_target_roles \
@@ -61,7 +64,9 @@ accelerate launch -m musubi_tuner.minimax_h3_train_network \
   --h3_reference_route dual
 ```
 
-Independent role caches can be assembled by encoding each role as a T=1 image, verifying that their reference latents are identical, and concatenating their target latents along latent time in the same order as `--h3_target_frame_indices`. Keep this derivation in cache metadata; the trainer records the active MFI contract in LoRA metadata.
+Replace the model and dataset paths before running the example. `--output_dir` is required for saving the trained weights; it has no usable default. Choose the training duration, optimizer and memory settings for your model and hardware as described in the [H3 training documentation](minimax_h3.md).
+
+Independent role caches can be assembled by encoding each role as a T=1 image, verifying that their reference latents are identical, and concatenating their target latents along latent time in the same order as `--h3_target_frame_indices`. Keep this derivation in cache metadata. The trainer records run-wide MFI options in LoRA metadata, including explicitly supplied CLI indices. When the index CLI options are omitted and coordinates come from each cached sample, the corresponding LoRA metadata fields contain `default`, not those sample-specific coordinates. The LoRA file alone cannot reconstruct that dataset contract: preserve the manifest (or grouped/video selection settings), cache tensors and contract sidecars, dataset configuration, and the meaning/order of the targets alongside it.
 
 ### Dataset and cache workflow
 
@@ -113,6 +118,21 @@ Train with `--h3_independent_target_roles --video_only --h3_reference_route dual
 
 Training-time samples also support MFI. Specify `--h3_target_frame_indices -6,8 --h3_visual_condition_frame_indices 0` in each sample-prompt line (or use the run-wide flags). Each sampled target is saved as its own PNG. Cache-derived indices alone cannot choose the intended layout for a separate sample prompt, so sampling requires explicit coordinates.
 
+## Feature scope
+
+The cache builder, trainer, training-time sampler and generation CLI do not share all options:
+
+| Workflow | MFI configuration |
+| --- | --- |
+| Cache creation (`minimax_h3_cache_mfi`) | Source entries and target/control indices; `--relative` or per-record `relative`; control-entry `mask`. These transformations are stored in the caches. |
+| Training (`minimax_h3_train_network`) | Cached indices, or matching CLI index overrides; run-wide reference route, target-noise coupling and condition-clean coefficients. Training consumes the prepared caches; it does not dynamically add interpolation targets or initialize targets from source images. |
+| Training-time samples | Explicit prompt or run-wide indices and sample reference images. Samples inherit the training route, target-noise coupling and condition-clean coefficients, but do not reuse the training dataset's cached layout or masked control latents. |
+| Generation (`minimax_h3_generate_video`, including `--from_file`) | The advanced generation options below: relative coordinates, interpolation, output selection, masks, initial image/latent, strength and sequence output. |
+
+The advanced generation flags below are not training CLI options and are not implemented for training-time samples. Do not copy them into training sample-prompt files: the text prompt parser can silently ignore unrecognized options. For relative or masked **training data**, use the cache-builder settings above; for training-time samples, supply the intended coordinates explicitly.
+
+## Advanced generation
+
 ### Relative coordinates, interpolation and output order
 
 `--h3_relative_positioning` subtracts the smallest explicit visual-condition index from both target and condition indices. With it omitted, the supplied indices are used directly. This coordinate conversion does not change Qwen's text positions; H3 does not promise invariance when only visual coordinates are translated relative to text/audio.
@@ -125,7 +145,9 @@ By default, only requested targets are decoded, in the requested order. `--h3_sa
 
 ### Masks and initial target state
 
-Repeat `--h3_control_mask mask.png` once per visual condition to mask its normalized VAE latent. White preserves the condition, black sets it to zero; masks are area-resized to the latent grid. Dataset control entries support the same `mask` field. This masks only DiT conditioning: Qwen still sees the complete control image, and this is not an attention mask or a target loss mask.
+Repeat `--h3_control_mask mask.png` once per visual condition to mask its normalized VAE latent. White preserves the latent and black sets it to zero **before condition-noise augmentation**; masks are area-resized to the latent grid. Dataset control entries support the same `mask` field, applied when building the cache.
+
+Both training and generation subsequently apply `c * masked_latent + (1 - c) * noise`, where `c` is `--h3_visual_cond_clean` (default `0.999`). A black region therefore becomes `0.001 * noise` with the default, not an exactly zero model input. Set `--h3_visual_cond_clean 1` if the masked latent must remain exactly zero, and record this choice in the training/inference contract. A black mask does not remove the reference tokens or their coordinates. Masking affects only DiT conditioning: Qwen still sees the complete control image, and this is not an attention mask or a target loss mask.
 
 Targets normally start from independent Gaussian noise. `--h3_initial_image image.png` broadcasts one encoded source image to all target slices; repeat it once per expanded target to provide different sources. Alternatively, `--h3_initial_latent source.safetensors` reads a `latent_video` tensor of the exact expanded target shape. The source is mixed with the selected noise according to `--h3_strength`:
 
@@ -134,6 +156,10 @@ Targets normally start from independent Gaussian noise. `--h3_initial_image imag
 - values between 0 and 1: start at a truncated H3 noise schedule and denoise the source.
 
 The video and audio clocks both start at the selected base sigma, using their respective H3 shifts. Strength is a base-sigma fraction, so it is not the linear video noise mixing coefficient after the video shift. Image sources use VAE posterior-mode encoding. Training keeps the usual flow-matching objective; using a source at inference does not imply that the LoRA was trained on that source distribution. To study a source-conditioned training contract, define and evaluate that contract separately.
+
+Repeated initial images and the time slices of an initial latent must follow the **internal sampling target order**, not the final PNG output order. Without interpolation, this is the supplied target-index order. With `--h3_interpolate` or `--h3_save_interpolated`, it is the expanded target set in ascending coordinate order, even when only the originally requested outputs are saved. Relative positioning subtracts a common origin and does not change this ordering.
+
+For example, targets `9,-3`, control `0`, and interpolation thresholds `2 3` produce internal targets `[-3,-2,3,6,9]`. Five distinct initial images (or five latent slices) must correspond to that order. With `--h3_interpolate` alone, the PNGs still follow requested indices `[9,-3]`, selected from internal slots `[4,0]`. A single initial image instead broadcasts to all five internal targets. The saved `h3_mfi_plan` metadata records the internal targets and output-slot mapping.
 
 ## Reference routes
 
