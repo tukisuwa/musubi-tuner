@@ -167,11 +167,11 @@ def _h3_image_dataset(tmp_path: Path, **overrides):
         ({"control_resolution": (512, 512)}, "control_resolution"),
         ({"fp_1f_target_index": -1}, "nonnegative"),
         # time-annotated control validation: indices and controls must arrive together, with an
-        # explicit target index and 1..2 nonnegative entries
+        # explicit target index and one or more nonnegative entries
         ({"control_directory": "controls"}, "require fp_1f_clean_indices"),
         ({"fp_1f_clean_indices": [0]}, "explicit fp_1f_target_index"),
         ({"fp_1f_clean_indices": [0], "fp_1f_target_index": 24}, "requires control images"),
-        ({"fp_1f_clean_indices": [0, 1, 2], "fp_1f_target_index": 24}, "1 or 2 entries"),
+        ({"fp_1f_clean_indices": [], "fp_1f_target_index": 24}, "at least one entry"),
         ({"fp_1f_clean_indices": [-1], "fp_1f_target_index": 24}, "nonnegative"),
     ],
 )

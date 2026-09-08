@@ -34,7 +34,7 @@ from musubi_tuner.dataset.image_video_dataset import ImageDataset, ItemInfo, Vid
 from musubi_tuner.dataset.media_utils import load_video
 from musubi_tuner.minimax_h3.audio_vae import encode_audio_mode, load_audio_vae
 from musubi_tuner.minimax_h3.checkpoint import resolve_safetensors_files
-from musubi_tuner.minimax_h3.packing import ONE_FRAME_AUDIO_LATENT_FRAMES, ONE_FRAME_VIDEO_LATENT_FRAMES
+from musubi_tuner.minimax_h3.packing import ONE_FRAME_AUDIO_LATENT_FRAMES, ONE_FRAME_VIDEO_LATENT_FRAMES, one_frame_condition_role
 from musubi_tuner.minimax_h3.media import (
     AUDIO_SAMPLE_RATE,
     AUDIO_TERMINAL_TOLERANCE_SAMPLES,
@@ -262,6 +262,9 @@ def _media_fingerprint_metadata(fingerprints: Mapping[Path, str]) -> str:
 # Bump whenever the cached tensor semantics change (posterior policy, normalization constants, key
 # layout, or the fingerprint formats) so --skip_existing rebuilds stale caches.
 LATENT_CACHE_FORMAT = "minimax-h3-latent-v2"
+# The one-frame counterpart, bumped for one-frame-only layout changes so that video caches are not
+# rebuilt along: v2 packs the conditions under the ordered cond_{i} roles (was first/last).
+ONE_FRAME_CACHE_FORMAT = "minimax-h3-one-frame-v2"
 
 
 def build_latent_metadata(
@@ -290,6 +293,7 @@ def build_latent_metadata(
         metadata["one_frame"] = "1"
         metadata["one_frame_target_index"] = str(one_frame_target_index)
         if one_frame_control_indices is not None:
+            metadata["one_frame_format"] = ONE_FRAME_CACHE_FORMAT
             metadata["one_frame_control_indices"] = ";".join(str(index) for index in one_frame_control_indices)
     return metadata
 
@@ -439,8 +443,8 @@ def build_one_frame_latent_tensors(
     """One-frame (image) target: a single video latent token, the silence audio placeholder,
     and the target's 24 fps pixel-frame index as a tensor entry for the trainer's RoPE override.
 
-    With control_frames/control_indices (K=1..2, fl2va editing/inbetween), each bucket-resized
-    control image becomes a condition latent under the packed (first, last) role keys, and the
+    With control_frames/control_indices (K>=1, fl2va editing/inbetween), each bucket-resized
+    control image becomes a condition latent under the ordered cond_NNN role keys, and the
     indices ride along as an int64 tensor for the trainer's condition-time overrides."""
     if target_index < 0:
         raise ValueError(f"MiniMax-H3 one-frame target index must be nonnegative, got {target_index}")
@@ -460,8 +464,8 @@ def build_one_frame_latent_tensors(
             f" got {tuple(silence_audio_latent.shape)}"
         )
     if control_frames is not None:
-        if not 1 <= len(control_frames) <= 2:
-            raise ValueError(f"MiniMax-H3 one-frame caching accepts 1 or 2 control images, got {len(control_frames)}")
+        if len(control_frames) < 1:
+            raise ValueError("MiniMax-H3 one-frame caching requires at least one control image when controls are given")
         if len(control_frames) != len(control_indices):
             raise ValueError(
                 f"MiniMax-H3 one-frame control count {len(control_frames)} does not match {len(control_indices)} control indices"
@@ -478,7 +482,8 @@ def build_one_frame_latent_tensors(
         _audio_key("", silence_audio_latent): silence_audio_latent,
     }
     if control_frames is not None:
-        for role, control in zip(("first", "last"), control_frames):
+        for index, control in enumerate(control_frames):
+            role = one_frame_condition_role(index)
             control = torch.as_tensor(control)
             if control.ndim != 3:
                 raise ValueError(f"MiniMax-H3 one-frame control must be [H,W,C], got {tuple(control.shape)}")
@@ -583,7 +588,7 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="experimental one-frame (image) training caches: accept image datasets whose items become single-token"
         " video targets with a silence audio placeholder. --task t2va caches plain image targets; --task fl2va"
-        " additionally encodes 1-2 control images as time-annotated conditions (fp_1f_clean_indices)",
+        " additionally encodes one or more control images as time-annotated conditions (fp_1f_clean_indices)",
     )
     parser.add_argument("--cache_seed", type=int, default=0, help="seed used for reproducible target-video posterior samples")
     parser.add_argument(
@@ -718,6 +723,8 @@ def main() -> None:
             one_frame_target_index=target_index,
             one_frame_control_indices=control_indices,
         )
+        if control_indices is not None:
+            expected_metadata["one_frame_control_paths"] = json.dumps([str(Path(path).resolve()) for path in control_paths])
         if skip_matching_cache and Path(item.latent_cache_path).is_file():
             if cache_metadata_matches(item.latent_cache_path, expected_metadata):
                 logger.info("Skipping matching MiniMax-H3 latent cache: %s", item.latent_cache_path)
@@ -737,7 +744,7 @@ def main() -> None:
             control_indices=control_indices,
         )
         logger.info("Saving MiniMax-H3 one-frame latent cache for %s to %s", item.item_key, item.latent_cache_path)
-        save_latent_cache_minimax_h3(item, payload.tensors, payload.metadata)
+        save_latent_cache_minimax_h3(item, payload.tensors, expected_metadata)
 
     def encode(batch: list[ItemInfo]) -> None:
         for item in batch:

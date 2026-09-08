@@ -19,12 +19,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -83,6 +84,9 @@ def _require_visual(visuals: Mapping[object, H3TextVisual], key: object, label: 
         raise ValueError(f"MiniMax-H3 presentation is missing {label} visual data") from error
 
 
+_ONE_FRAME_CONDITION_KEY = re.compile(r"^cond_\d{3,}$")
+
+
 def build_presentation(
     record: H3Record,
     task: H3Task,
@@ -103,8 +107,20 @@ def build_presentation(
     if task == "fl2va":
         # the released builder numbers <Picture i> over the pictures that are present,
         # in packed (first, last) order: a lone last frame is still <Picture 1>, and the
-        # first/last distinction is carried only by the rotary anchor times
+        # first/last distinction is carried only by the rotary anchor times. One-frame
+        # layouts use the ordered cond_{i} slots instead, numbered in slot order.
         present_keys = [key for key in ("first", "last") if key in visuals]
+        cond_keys = sorted(
+            (key for key in visuals if isinstance(key, str) and _ONE_FRAME_CONDITION_KEY.fullmatch(key)),
+            key=lambda key: int(key[5:]),
+        )
+        if present_keys and cond_keys:
+            raise ValueError("MiniMax-H3 FL2VA presentation cannot mix first/last visuals with one-frame cond_ visuals")
+        if cond_keys:
+            expected = [f"cond_{index:03d}" for index in range(len(cond_keys))]
+            if cond_keys != expected:
+                raise ValueError(f"MiniMax-H3 one-frame FL2VA visuals must be the contiguous {expected}, got {cond_keys}")
+            present_keys = cond_keys
         if not present_keys:
             raise ValueError("MiniMax-H3 FL2VA presentation requires at least one of the first and last visuals")
         for index, key in enumerate(present_keys, start=1):
@@ -616,6 +632,7 @@ def presentation_fingerprint(
     media_fingerprints: Mapping[Path, str],
     *,
     frame_count: int,
+    ordered_media_paths: Sequence[str | Path] | None = None,
 ) -> str:
     # frame_count is part of the identity because Ref2VA reference videos are resampled to the
     # target frame count before presentation. The target crop start is deliberately excluded: it
@@ -629,5 +646,7 @@ def presentation_fingerprint(
         "frame_count": frame_count,
         "format": "minimax-h3-non-chat-v2",
     }
+    if ordered_media_paths is not None:
+        payload["ordered_media_paths"] = [str(Path(path).resolve()) for path in ordered_media_paths]
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"

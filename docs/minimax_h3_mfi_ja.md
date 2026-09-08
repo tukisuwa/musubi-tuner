@@ -78,6 +78,37 @@ MFIでは、生成枚数を`--frame_count`で指定しません。基本の生�
 - `images`：画像のみ。
 - `latent_images`：latentと画像の両方。
 
+## FL2VAで3枚以上の参照画像を使う
+
+MFIは、Ref2VAだけでなくFL2VAの条件画像にも対応します。本家の[PR #1096](https://github.com/kohya-ss/musubi-tuner/pull/1096)と同様に、条件画像を順序付きで渡せます。さらにMFIでは、ターゲットを複数指定してまとめて生成できます。**3枚以上の条件画像は実験的な使い方**で、品質の改善を保証するものではありません。
+
+例えば、座標`0,48,96`の3枚を参照して、座標`24,72`の2枚を生成するコマンドです。モデルのパスは手元のものに置き換えてください。
+
+```bash
+python -m musubi_tuner.minimax_h3_generate_video \
+  --task fl2va --dit /path/to/fl2va_dit.safetensors \
+  --video_vae /path/to/video_vae.safetensors \
+  --audio_vae /path/to/audio_vae.safetensors \
+  --text_encoder /path/to/qwen.safetensors \
+  --prompt "Describe the images and the intended result." \
+  --condition_image a.png --condition_image b.png --condition_image c.png \
+  --h3_independent_target_roles \
+  --h3_target_frame_indices 24,72 \
+  --h3_visual_condition_frame_indices 0,48,96 \
+  --output_type images --output outputs/fl2va_mfi
+```
+
+`a.png`が座標0、`b.png`が48、`c.png`が96に対応します。ターゲットを`24`だけにすれば1枚生成です。必要なメモリ設定は[H3共通ドキュメント](minimax_h3.md)を参照してください。
+
+- FL2VA用のチェックポイントを使い、`--h3_reference_route`は省略（既定の`native`）します。Ref2VAの`--ref`や`dual`指定に置き換えないでください。
+- `--condition_image`は指定順を保持します。既存の`--first_frame`／`--last_frame`も使えますが、`--condition_image`とは併用できません。
+- 学習用データは、次節のJSONL・画像グループ・動画選択をそのまま使えます。キャッシュの両段階に`--task fl2va`を指定し、`--route dual`は省略します。学習も`--task fl2va --h3_independent_target_roles --video_only`とし、`--h3_reference_route dual`は省略します。キャッシュの座標を使う場合、学習CLIの座標指定は不要です。
+- 学習中サンプルと`--from_file`では、画像ごとに`--ci a.png --ci b.png --ci c.png`と書き、ターゲット座標と参照座標も指定します。
+
+MFIを使わず本家と同じ1枚生成モードで試す場合は、MFIの3つのフラグを外し、`--frame_count 1 --one_frame "target_index=24,control_index=0;48;96"`を使います。詳しくは[1枚生成の説明](minimax_h3_1f.md)を参照してください。MFIとは内部レイアウトが異なるため、出力の完全一致を意味するものではありません。
+
+既存のRef2VA用MFIキャッシュをFL2VAへ流用することはできません。新しいディレクトリに両段階のキャッシュを作成してください。旧one-frame FL2VAキャッシュも、latentとtextの両方を再作成してください（各キャッシュコマンドの`--skip_existing`で変更を検出します）。通常の動画FL2VAのキャッシュは変更ありません。
+
 ## 自分のデータで学習する
 
 基本の流れは「画像の対応を記述する → キャッシュを作る → 学習を実行する」です。ここではJSONL形式のmanifestを使います。manifestは、参照画像・正解画像・座標の対応を記したファイルです。
@@ -363,8 +394,8 @@ LoRA単体では学習データの対応関係を復元できないため、次�
 
 ## 互換性と制限
 
-- MFIフラグを省略した場合、通常のH3動画、one-frame、ConvRot/NVFP4、long-durationの動作は変わりません。
+- MFIは明示的に有効にした場合だけ動作します。通常のH3動画、ConvRot/NVFP4、long-durationは従来どおりです。one-frame FL2VAにも複数条件画像の対応を追加したため、旧キャッシュは前述のとおり再作成してください。
 - MFIは、公式の`--one_frame`モードや時間方向の伸張（temporal stretching）とは別の機能です。
 - 明示的な参照座標は、Ref2VAの画像参照（最大9枚）とFL2VAの画像条件に対応します。動画から選んだフレームも、MFIには独立にエンコードした画像として渡します。
-- FL2VAの学習中サンプル生成は、先頭画像のみ、末尾画像のみ、両方に対応します。入力画像ごとに1つの視覚条件インデックスが必要です。
+- FL2VAの学習中サンプル生成は、順序付きの`--ci`リスト、または先頭画像のみ・末尾画像のみ・両方の指定に対応します。入力画像ごとに1つの視覚条件インデックスが必要です。
 - バッチMFI出力には音声プレースホルダーを保存しません。decode-onlyでも、古いMFIファイルに残っている音声プレースホルダーは無視します。

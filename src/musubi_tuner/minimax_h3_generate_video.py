@@ -27,6 +27,7 @@ from musubi_tuner.minimax_h3.generation_inputs import (
     decode_generation_visuals,
     encode_audio_conditions,
     encode_visual_conditions,
+    fl_condition_entries,
     load_generation_record,
     parse_one_frame_options,
 )
@@ -256,15 +257,15 @@ def validate_prompt_args(args: argparse.Namespace, *, directory_output: bool = F
     if one_frame:
         _, control_indices = parse_one_frame_options(args.one_frame) if args.one_frame else (0, None)
         if args.task == "fl2va":
-            provided_frames = int(bool(args.first_frame)) + int(bool(args.last_frame))
-            # a missing-frames error is raised by the task input checks below
-            if provided_frames and (control_indices is None or len(control_indices) != provided_frames):
+            entries = fl_condition_entries(args)
+            # a missing-images error is raised by the task input checks below
+            if entries and (control_indices is None or len(control_indices) != len(entries)):
                 given = 0 if control_indices is None else len(control_indices)
-                provided = " and ".join(label for label in ("first_frame", "last_frame") if getattr(args, label))
+                provided = ", ".join(path for _, path in entries)
                 raise ValueError(
-                    "MiniMax-H3 one-frame FL2VA requires --one_frame control_index with one entry per provided frame:"
-                    f" got {given} control_index entries for {provided_frames} condition frames ({provided}), "
-                    'e.g. --one_frame "target_index=24,control_index=0" for a first frame at index 0'
+                    "MiniMax-H3 one-frame FL2VA requires --one_frame control_index with one entry per condition image:"
+                    f" got {given} control_index entries for {len(entries)} condition images ({provided}), "
+                    'e.g. --one_frame "target_index=24,control_index=0" for one condition at index 0'
                 )
         elif control_indices is not None:
             raise ValueError("MiniMax-H3 --one_frame control_index applies only to FL2VA conditions")
@@ -315,11 +316,12 @@ def validate_prompt_args(args: argparse.Namespace, *, directory_output: bool = F
     if args.trajectory_dir and args.output_type == "latent":
         raise ValueError("MiniMax-H3 --trajectory_dir decodes per-step estimates and cannot combine with --output_type latent")
 
+    condition_images = getattr(args, "condition_image", None)
     if args.task == "t2va":
         if not args.prompt:
             raise ValueError("MiniMax-H3 T2VA requires --prompt")
-        if args.first_frame or args.last_frame or args.reference_jsonl or args.ref:
-            raise ValueError("MiniMax-H3 T2VA does not accept first/last/reference inputs")
+        if args.first_frame or args.last_frame or condition_images or args.reference_jsonl or args.ref:
+            raise ValueError("MiniMax-H3 T2VA does not accept condition/first/last/reference inputs")
     elif args.task == "fl2va":
         if getattr(args, "text_cache", None) is not None:
             raise ValueError("MiniMax-H3 FL2VA generation does not accept --text_cache")
@@ -327,24 +329,26 @@ def validate_prompt_args(args: argparse.Namespace, *, directory_output: bool = F
             raise ValueError("MiniMax-H3 FL2VA requires --prompt")
         if args.reference_jsonl or args.ref:
             raise ValueError("MiniMax-H3 FL2VA does not accept --reference_jsonl or --ref")
-        if not args.first_frame and not args.last_frame:
+        entries = fl_condition_entries(args)
+        if not entries:
             raise ValueError(
                 "MiniMax-H3 FL2VA requires --first_frame and/or --last_frame"
-                " (first only = I2VA, last only = L2VA; use --task t2va to condition on neither)"
+                " (first only = I2VA, last only = L2VA), or ordered --condition_image entries for one-frame/MFI targets"
             )
-        for label in ("first_frame", "last_frame"):
-            if getattr(args, label):
-                _require_path(getattr(args, label), label)
+        for label, path in entries:
+            _require_path(path, label)
+        if mfi and (condition_indices is None or len(condition_indices) != len(entries)):
+            raise ValueError("MFI FL2VA requires one --h3_visual_condition_frame_indices entry per condition image")
     else:
         text_only = getattr(args, "h3_reference_route", "native") == "text_only"
         if text_only and not args.ref and not args.reference_jsonl:
-            if not args.prompt or args.first_frame or args.last_frame:
+            if not args.prompt or args.first_frame or args.last_frame or condition_images:
                 raise ValueError("H3 text_only requires a prompt and no first/last frames")
             return
         if bool(args.reference_jsonl) == bool(args.ref):
             raise ValueError("MiniMax-H3 Ref2VA requires exactly one of --reference_jsonl or --ref")
-        if args.first_frame or args.last_frame:
-            raise ValueError("MiniMax-H3 Ref2VA does not accept --first_frame or --last_frame")
+        if args.first_frame or args.last_frame or condition_images:
+            raise ValueError("MiniMax-H3 Ref2VA does not accept --first_frame, --last_frame or --condition_image")
         if args.ref:
             if not args.prompt:
                 raise ValueError("MiniMax-H3 Ref2VA with --ref requires --prompt")
@@ -487,14 +491,17 @@ def _text_conditioning_cache_key(args: argparse.Namespace, record: H3Record, pre
     # the presentation fingerprint hashes text and media shapes; media contents enter through
     # per-file fingerprints. FL2VA frames are not record references, so they are added here.
     if args.task == "fl2va":
-        media_fingerprints = {Path(path): fingerprint_file(path) for path in (args.first_frame, args.last_frame) if path}
+        media_fingerprints = {Path(path): fingerprint_file(path) for _, path in fl_condition_entries(args)}
     else:
         media_fingerprints = {
             reference.path: fingerprint_file(reference.path)
             for reference in record.references
             if reference.type in {"image", "video"}
         }
-    return presentation_fingerprint(presentation, media_fingerprints, frame_count=args.frame_count)
+    return presentation_fingerprint(
+        presentation, media_fingerprints, frame_count=args.frame_count,
+        ordered_media_paths=[path for _, path in fl_condition_entries(args)] if args.task == "fl2va" else None,
+    )
 
 
 def _encode_text(
@@ -792,7 +799,7 @@ def _build_layout(args: argparse.Namespace, text_length: int, visual_geometries,
     one_frame = args.frame_count == 1 and not mfi
     condition_roles = None
     if args.task == "fl2va":
-        condition_roles = tuple(role for role, path in (("first", args.first_frame), ("last", args.last_frame)) if path)
+        condition_roles = tuple(role for role, _ in fl_condition_entries(args))
     layout = build_h3_layout(
         task=route_task(args, "dit"),
         text_length=text_length,
@@ -1205,8 +1212,9 @@ def parse_prompt_line(line: str) -> dict:
     """Parse an interactive/from-file prompt line into argument overrides.
 
     Format: "prompt text --w 768 --h 1344 --f 1 --d 42 --s 30 --fs 12.0 --fsa 3.0
-    --ofps 12 --skb 3 --i first.png --ei last.png --ref face.png --of target_index=24 --o name.png".
-    --ref is repeatable and replaces any session-level --ref list. A line starting
+    --ofps 12 --skb 3 --i first.png --ei last.png --ci cond.png --ref face.png --of target_index=24 --o name.png".
+    --ref and --ci are repeatable and each replaces its session-level list (--ci is the
+    ordered one-frame FL2VA condition list, --condition_image). A line starting
     with "--" carries only options; without prompt text the command-line --prompt
     (when given) stays in effect. The literal string "\\n" in the prompt text becomes
     a newline, for the multi-line official prompt format.
@@ -1217,6 +1225,7 @@ def parse_prompt_line(line: str) -> dict:
     if parts[0].strip():
         overrides["prompt"] = parts[0].strip().replace("\\n", "\n")
     refs: list[str] = []
+    condition_images: list[str] = []
     for part in parts[1:]:
         part = part.strip()
         if not part:
@@ -1245,6 +1254,8 @@ def parse_prompt_line(line: str) -> dict:
             overrides["first_frame"] = value
         elif option == "ei":
             overrides["last_frame"] = value
+        elif option == "ci":
+            condition_images.append(value)
         elif option == "ref":
             refs.append(value)
         elif option == "of":
@@ -1269,6 +1280,8 @@ def parse_prompt_line(line: str) -> dict:
             raise ValueError(f"MiniMax-H3 prompt line has unknown option --{option}")
     if refs:
         overrides["ref"] = refs
+    if condition_images:
+        overrides["condition_image"] = condition_images
     return overrides
 
 
@@ -1677,6 +1690,17 @@ def setup_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--first_frame", default=None)
     parser.add_argument("--last_frame", default=None)
+    parser.add_argument(
+        "--condition_image",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="FL2VA condition image, repeatable (requires --frame_count 1 or --h3_independent_target_roles):"
+        " numbered <Picture i> in this order and placed by --one_frame control_index, or by"
+        " --h3_visual_condition_frame_indices in MFI mode. Any count"
+        " (the released FL2VA API takes one or two pictures; three or more is experimental). --first_frame /"
+        " --last_frame are aliases for the first two slots and cannot be combined with this option",
+    )
     parser.add_argument("--reference_jsonl", default=None)
     parser.add_argument("--reference_index", type=int, default=0)
     parser.add_argument(
@@ -1704,7 +1728,8 @@ def setup_parser() -> argparse.ArgumentParser:
         metavar="target_index=N,control_index=A;B",
         help="one-frame mode time options (requires --frame_count 1): 0-based 24 fps pixel-frame indices on the"
         " nominal timeline, converted to RoPE times relative to the target-block cursor. target_index (default 0)"
-        " places the generated frame; control_index places the FL2VA condition frames in --first_frame/--last_frame"
+        " places the generated frame; control_index places the FL2VA condition images in --condition_image"
+        " (or --first_frame/--last_frame)"
         " order and is required when conditions are present. The base model reads these as trainable time inputs;"
         " see docs/minimax_h3_1f.md",
     )
@@ -1783,7 +1808,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--from_file",
         default=None,
-        help="batch mode: read prompt lines (with inline --w/--h/--f/--d/--s/--fs/--fsa/--ofps/--skb/--i/--ei/--ref/--of/--o"
+        help="batch mode: read prompt lines (with inline --w/--h/--f/--d/--s/--fs/--fsa/--ofps/--skb/--i/--ei/--ci/--ref/--of/--o"
         " options) from a file and run them in phases, loading each model family once. Sampled latents are saved"
         " to the --output directory before decoding so a crash loses nothing; the files are removed after their"
         " output is written unless --output_type keeps latents. See docs/minimax_h3.md",

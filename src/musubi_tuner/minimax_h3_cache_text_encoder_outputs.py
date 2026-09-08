@@ -28,6 +28,7 @@ from musubi_tuner.minimax_h3.text_encoder import (
     wrap_ref_teacher_caption,
 )
 from musubi_tuner.minimax_h3.media import H3AudioSource, H3Record, H3Reference, h3_records_from_datasource
+from musubi_tuner.minimax_h3.packing import one_frame_condition_role
 from musubi_tuner.minimax_h3_cache_latents import (
     PyAVH3MediaDecoder,
     _adapt_canvas,
@@ -356,10 +357,10 @@ def main() -> None:
                     control_indices = item.fp_1f_clean_indices
                     if not control_indices or controls is None or len(controls) != len(control_indices):
                         raise ValueError(f"MiniMax-H3 fl2va one-frame item is missing its control images: {item.item_key}")
-                    for role, control in zip(("first", "last"), controls):
+                    for index, control in enumerate(controls):
                         # the dataset keeps RGBA controls as-is; drop alpha the same way the
                         # latent path does (_prepare_pixels), the processor accepts only RGB
-                        visuals[role] = H3TextVisual(torch.as_tensor(control)[..., :3].unsqueeze(0))
+                        visuals[one_frame_condition_role(index)] = H3TextVisual(torch.as_tensor(control)[..., :3].unsqueeze(0))
                     control_paths = control_paths_by_dir.get(cache_dir_key, {}).get(item.item_key)
                     if control_paths is None or len(control_paths) != len(control_indices):
                         raise ValueError(f"MiniMax-H3 fl2va one-frame item is missing its control paths: {item.item_key}")
@@ -380,6 +381,7 @@ def main() -> None:
                 presentation,
                 record_media_fingerprints,
                 frame_count=frame_count,
+                ordered_media_paths=control_paths if cache_dir_key in image_dirs and args.task == "fl2va" else None,
             )
             teacher_presentation = None
             teacher_presentation_identity = None

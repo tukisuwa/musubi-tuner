@@ -40,6 +40,32 @@ The PNG names preserve slot and index; with the example above they are `000_inde
 
 `shared` target noise broadcasts the first target slice's initial noise to every role. It preserves each slice's standard-normal marginal but changes cross-role covariance. Models trained with `independent` noise should normally be inferred with `independent` noise.
 
+## Ordered FL2VA conditions (three or more images)
+
+Like upstream [PR #1096](https://github.com/kohya-ss/musubi-tuner/pull/1096), one-frame FL2VA accepts an ordered condition list of any count. MFI extends this to jointly generated targets. **Three or more conditions are experimental; validate quality against the two-condition baseline.**
+
+```bash
+python -m musubi_tuner.minimax_h3_generate_video \
+  --task fl2va --dit /path/to/fl2va_dit.safetensors \
+  --video_vae /path/to/video_vae.safetensors \
+  --audio_vae /path/to/audio_vae.safetensors \
+  --text_encoder /path/to/qwen.safetensors \
+  --prompt "Describe the images and the intended result." \
+  --condition_image a.png --condition_image b.png --condition_image c.png \
+  --h3_independent_target_roles \
+  --h3_target_frame_indices 24,72 \
+  --h3_visual_condition_frame_indices 0,48,96 \
+  --output_type images --output outputs/fl2va_mfi
+```
+
+The images map to coordinates `0,48,96` in that exact order; targets `24,72` are generated jointly. Use a single target index for one output. Replace checkpoint paths and choose memory settings from the [H3 documentation](minimax_h3.md). FL2VA uses its own checkpoint and the default `--h3_reference_route native`, not Ref2VA's `--ref` or `dual` route. `--first_frame`/`--last_frame` remain accepted aliases but cannot be combined with `--condition_image`.
+
+For training, use the same MFI manifest/grouped-image/video workflow below, with **`--task fl2va` on both cache stages**, omitting `--route dual` (FL2VA defaults to `native`). Train with `--task fl2va --h3_independent_target_roles --video_only`, omitting `--h3_reference_route dual`; omit CLI index overrides to use cached coordinates. The cache stores ordered `latents_cond_NNN` entries and MFI index tensors, with matching `<Picture i>` text visuals. Training samples and `--from_file` use repeatable `--ci` plus explicit target/control indices.
+
+For the upstream-style single-image mode without MFI, replace the three MFI flags with `--frame_count 1 --one_frame "target_index=24,control_index=0;48;96"`; see [one-frame FL2VA](minimax_h3_1f.md). That mode and MFI have distinct internal layouts, so identical outputs are not promised.
+
+Do not reuse Ref2VA MFI caches for FL2VA: create both stages in a new directory. Old one-frame FL2VA caches also need latent **and text** regeneration (`--skip_existing` detects the changes): latent keys now use `cond_NNN`, and text-cache identity now includes condition order. Video FL2VA caches are unchanged.
+
 ## Training
 
 The training cache must expose:
@@ -177,11 +203,11 @@ The route experiments still use the Ref2VA base family (`--task ref2va`). For `q
 
 Generation accepts the same `--h3_reference_route` option (also per prompt in `--from_file`). Training-time samples automatically inherit the training route. Caption-only routes remove reference rows from the Qwen presentation; routes without DiT references omit those tokens entirely. `text_only` may use just `--prompt`, without reference inputs. Explicit control indices may still define relative target positioning, but are not inserted as DiT reference tokens on routes without DiT references. Existing text caches must match the routed presentation; incompatible caches are rejected.
 
-FL2VA MFI training samples accept first-only, last-only, or both controls, with one explicit visual-condition index per provided image. Batch MFI outputs omit placeholder audio, and decode-only also ignores placeholder audio in older MFI files.
+FL2VA MFI training samples accept an ordered `--ci` list, or first-only, last-only, or both aliases, with one explicit visual-condition index per image. Batch MFI outputs omit placeholder audio, and decode-only also ignores placeholder audio in older MFI files.
 
 ## Compatibility and limits
 
-- The feature is opt-in. With the MFI flags omitted, native H3 video, one-frame, ConvRot/NVFP4, and long-duration behavior is unchanged.
+- MFI is opt-in. Native video, ConvRot/NVFP4, and long-duration behavior is unchanged. One-frame FL2VA also supports the ordered condition list without MFI; regenerate its old caches as described above.
 - MFI is separate from the official `--one_frame` mode and temporal stretching.
 - Explicit visual indices support image Ref2VA references (up to the H3 limit of nine) and FL2VA image conditions. Video dataset frames enter MFI as independently encoded images.
 - Joint roles attend to one another. Joint generation is therefore not equivalent to running one role at a time, even with matched noise slices.

@@ -19,9 +19,22 @@ from PIL import Image
 import torch
 
 from musubi_tuner.minimax_h3.mfi import plan_indices, mask_condition
+from musubi_tuner.minimax_h3.packing import one_frame_condition_role
+
+
+def resolve_cache_route(task, route):
+    if task not in {"ref2va", "fl2va"}:
+        raise ValueError("MFI caches support --task ref2va or fl2va")
+    route = route or ("native" if task == "fl2va" else "dual")
+    allowed = {"native"} if task == "fl2va" else {"dual", "dit_latent_only", "qwen_image_only", "text_only"}
+    if route not in allowed:
+        raise ValueError(f"MFI --task {task} does not support --route {route}; use {sorted(allowed)}")
+    return route
 
 
 def read_records(args):
+    task = getattr(args, "task", "ref2va")
+    route = resolve_cache_route(task, args.route)
     base = Path(args.manifest).resolve().parent if args.manifest else Path.cwd()
     if args.manifest:
         records = [json.loads(line) for line in Path(args.manifest).read_text().splitlines() if line.strip()]
@@ -77,9 +90,9 @@ def read_records(args):
         seen.add(record["id"])
         record.setdefault("controls", [])
         record.setdefault("caption", args.caption)
-        if args.route in {"dual", "dit_latent_only", "qwen_image_only"} and not record["controls"]:
-            raise ValueError(f"MFI {args.route} requires controls")
-        if len(record["controls"]) > 9:
+        if route in {"native", "dual", "dit_latent_only", "qwen_image_only"} and not record["controls"]:
+            raise ValueError(f"MFI {route} requires controls")
+        if task == "ref2va" and len(record["controls"]) > 9:
             raise ValueError("H3 Ref2VA supports at most 9 image controls")
         for entry in record["targets"] + record["controls"]:
             for key in ("path", "mask"):
@@ -120,7 +133,8 @@ def read_frame(entry, size, videos):
     return torch.from_numpy(np.array(image.resize(size, Image.Resampling.LANCZOS)))
 
 
-def build_mfi_tensors(record, *, video_vae, silence, size, seed, relative=False, route="dual"):
+def build_mfi_tensors(record, *, video_vae, silence, size, seed, relative=False, route=None, task="ref2va"):
+    route = resolve_cache_route(task, route)
     from musubi_tuner.minimax_h3_cache_latents import (
         _prepare_pixels,
         _encode_target_video,
@@ -148,24 +162,22 @@ def build_mfi_tensors(record, *, video_vae, silence, size, seed, relative=False,
         "audio_present_float32": torch.tensor(0.0),
         "mfi_target_indices_int64": torch.tensor(plan.targets, dtype=torch.int64),
     }
-    controls = record["controls"] if route in {"dual", "dit_latent_only"} else []
-    if route in {"dual", "dit_latent_only"} and not controls:
+    controls = record["controls"] if route in {"native", "dual", "dit_latent_only"} else []
+    if route in {"native", "dual", "dit_latent_only"} and not controls:
         raise ValueError(f"MFI {route} requires controls")
     tensors["mfi_control_indices_int64"] = torch.tensor(plan.controls if controls else (), dtype=torch.int64)
     for slot, entry in enumerate(controls):
         latent = _encode_condition_video(video_vae, _prepare_pixels(read_frame(entry, size, videos)[None]))
         if "mask" in entry:
             latent = mask_condition(latent, np.asarray(Image.open(entry["mask"]).convert("L"), dtype=np.float32) / 255)
-        tensors[_visual_key(f"ref_{slot:03d}_image", latent[0])] = latent[0].cpu()
+        role = one_frame_condition_role(slot) if task == "fl2va" else f"ref_{slot:03d}_image"
+        tensors[_visual_key(role, latent[0])] = latent[0].cpu()
     if any(not torch.isfinite(t).all() for t in tensors.values()):
         raise ValueError("MFI cache contains nonfinite tensors")
     return tensors
 
 
-def main():
-    from musubi_tuner.dataset.image_video_dataset import ItemInfo
-    from musubi_tuner.dataset.cache_io import save_latent_cache_minimax_h3, save_text_encoder_output_cache_minimax_h3
-
+def setup_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--manifest")
@@ -184,14 +196,28 @@ def main():
     parser.add_argument("--max_targets", type=int, default=4)
     parser.add_argument("--max_frame_distance", type=int, default=32)
     parser.add_argument("--samples_per_video", type=int, default=1)
-    parser.add_argument("--route", choices=("dual", "dit_latent_only", "qwen_image_only", "text_only"), default="dual")
+    parser.add_argument("--task", choices=("ref2va", "fl2va"), default="ref2va")
+    parser.add_argument(
+        "--route",
+        choices=("native", "dual", "dit_latent_only", "qwen_image_only", "text_only"),
+        help="default: native for FL2VA, dual for Ref2VA; route experiments are Ref2VA-only",
+    )
     parser.add_argument("--video_vae")
     parser.add_argument("--audio_vae")
     parser.add_argument("--text_encoder")
     parser.add_argument("--text_encoder_blocks_to_swap", type=int, default=0)
     parser.add_argument("--text_encoder_attn_mode", default="sdpa")
     parser.add_argument("--device", default="cuda")
+    return parser
+
+
+def main():
+    from musubi_tuner.dataset.image_video_dataset import ItemInfo
+    from musubi_tuner.dataset.cache_io import save_latent_cache_minimax_h3, save_text_encoder_output_cache_minimax_h3
+
+    parser = setup_parser()
     args = parser.parse_args()
+    args.route = resolve_cache_route(args.task, args.route)
     if min(args.width, args.height) <= 0 or args.width % 32 or args.height % 32:
         parser.error("size must be positive multiples of 32")
     if min(args.num_controls, args.max_targets, args.max_frame_distance, args.samples_per_video) <= 0:
@@ -221,7 +247,13 @@ def main():
         }
         contract = json.dumps(
             dict(
-                record=record, route=args.route, relative=args.relative, seed=args.seed, size=[args.width, args.height], media=media
+                record=record,
+                route=args.route,
+                relative=args.relative,
+                seed=args.seed,
+                size=[args.width, args.height],
+                media=media,
+                **({"task": "fl2va", "condition_format": "cond-v1"} if args.task == "fl2va" else {}),
             ),
             sort_keys=True,
         )
@@ -281,23 +313,29 @@ def main():
                 seed=args.seed,
                 relative=args.relative,
                 route=args.route,
+                task=args.task,
             )
             save_latent_cache_minimax_h3(item, tensors, metadata)
         else:
-            controls = record["controls"] if args.route in {"dual", "qwen_image_only"} else []
+            controls = record["controls"] if args.route in {"native", "dual", "qwen_image_only"} else []
             if args.route == "qwen_image_only" and not controls:
                 raise ValueError("Qwen-image-only route requires controls")
             # Synthetic unique paths identify separately sampled frames of the same video.
             refs = tuple(H3Reference(type="image", path=Path(f"mfi-control-{i}.png")) for i in range(len(controls)))
             videos = {}
             visuals = {
-                ref.path: H3TextVisual(read_frame(entry, (args.width, args.height), videos)[None])
-                for ref, entry in zip(refs, controls)
+                (one_frame_condition_role(i) if args.task == "fl2va" else ref.path): H3TextVisual(
+                    read_frame(entry, (args.width, args.height), videos)[None]
+                )
+                for i, (ref, entry) in enumerate(zip(refs, controls))
             }
             h3_record = H3Record(
-                video_path=Path(record["targets"][0]["path"]), caption=record["caption"], references=refs, jsonl_line=1
+                video_path=Path(record["targets"][0]["path"]),
+                caption=record["caption"],
+                references=() if args.task == "fl2va" else refs,
+                jsonl_line=1,
             )
-            presentation = build_presentation(h3_record, "ref2va" if refs else "t2va", visuals)
+            presentation = build_presentation(h3_record, args.task if controls else "t2va", visuals)
             hidden, tags = encode_h3_presentation(processor, encoder, presentation)
             save_text_encoder_output_cache_minimax_h3(
                 item,
