@@ -2,12 +2,19 @@
 
 [English](./README.md) | [日本語](./README.ja.md)
 
+## MiniMax-H3 MFI (experimental)
+
+This branch adds indexed multi-frame inference (MFI) and LoRA training for MiniMax-H3. MFI generates multiple images jointly, allowing them to share information during generation. Each image is assigned a coordinate; its intended role is defined by your training data and settings, not by a built-in label.
+
+See the [English MFI guide](./docs/minimax_h3_mfi.md) / [日本語ガイド](./docs/minimax_h3_mfi_ja.md) for generation, dataset preparation, training, and limitations.
+
 ## Table of Contents
 
 <details>
 <summary>Click to expand</summary>
 
 - [Musubi Tuner](#musubi-tuner)
+  - [MiniMax-H3 MFI (experimental)](#minimax-h3-mfi-experimental)
   - [Table of Contents](#table-of-contents)
   - [Introduction](#introduction)
     - [Sponsors](#sponsors)
